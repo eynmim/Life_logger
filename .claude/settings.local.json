@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m ensurepip --version)",
+      "Bash(\"C:/Users/manso/.platformio/penv/Scripts/python.exe\" -m ensurepip --version)",
+      "Bash(\"C:/Users/manso/.platformio/penv/Scripts/python.exe\" --version)",
+      "Bash(\"C:/Users/manso/.platformio/penv/Scripts/python.exe\" -c \"import venv; print\\(''venv OK''\\)\")",
+      "Bash(\"C:/Users/manso/.platformio/penv/Scripts/python.exe\" -m venv --help)",
+      "Bash(\"C:/Users/manso/.platformio/penv/Scripts/python.exe\" -m venv \"C:/Users/manso/.platformio/penv/.espidf-5.5.3\")",
+      "Bash(\"C:/Users/manso/.platformio/penv/.espidf-5.5.3/Scripts/python.exe\" -m ensurepip --upgrade --default-pip)",
+      "Bash(ls \"C:/Users/manso/.platformio/penv/.espidf-5.5.3/Scripts/pip\"*)",
+      "Read(//c/Users/manso/.platformio/platforms/espressif32/builder/frameworks/**)",
+      "Bash(\"C:/Users/manso/.platformio/penv/.espidf-5.5.3/Scripts/python.exe\" -m pip install --upgrade pip)",
+      "Bash(echo \"done: $?\")",
+      "Bash(python -c \"import serial.tools.list_ports; [print\\(f''  {p.device}: {p.description} [{p.hwid}]''\\) for p in serial.tools.list_ports.comports\\(\\)]\")",
+      "Bash(python -c \":*)",
+      "Bash(find . -type f \\\\\\(-name *esp_sr* -o -name *afe* \\\\\\))",
+      "Bash(xargs -0 grep -l \"esp-sr\\\\|ESP-SR\\\\|AFE\\\\|audio front end\")",
+      "Bash(xargs cat:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.espressif.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:components.espressif.com)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\manso\\.platformio\\penv\\.espidf-5.5.3",
+      "C:\\Users\\manso\\.platformio\\penv\\Scripts",
+      "f:\\Aida_project\\MOSA_MIC_PROJ\\.vscode"
+    ]
+  }
+}

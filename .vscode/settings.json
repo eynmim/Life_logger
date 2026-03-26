@@ -2,5 +2,6 @@
     "files.watcherExclude": {
         "**/managed_components/**": true,
         "**/.pio/**": true
-    }
+    },
+    "idf.currentSetup": "C:\\Users\\manso\\esp\\v5.5.2\\esp-idf"
 }
