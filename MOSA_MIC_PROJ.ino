@@ -1,22 +1,30 @@
 /*
- * XIAO ESP32-S3 — Dual INMP441 Calibrated System
- * =================================================
- * HP filter, noise gate, SNR metering, Serial Plotter,
- * and WAV streaming to PC.
+ * XIAO ESP32-S3 — Dual INMP441 Beamformed Noise Reduction System
+ * ================================================================
+ * Dual-mic beamforming, FFT spectral subtraction, HP filter,
+ * noise gate, SNR metering, Serial Plotter, and WAV streaming.
+ *
+ * Pipeline (WAV mode):
+ *   Mic1 + Mic2 → HP filter → Beamform (average) → FFT →
+ *   Spectral Subtraction → IFFT → Overlap-Add → Clean mono WAV
  *
  * Mic1 (I2S0): SCK=GPIO5  WS=GPIO43 SD=GPIO6  L/R=GPIO44
  * Mic2 (I2S1): SCK=GPIO9  WS=GPIO7  SD=GPIO8  L/R=GPIO4
  *
+ * Requires: arduinoFFT library (by kosme, v2.x)
+ *   Install via Arduino IDE: Sketch > Include Library > Manage Libraries
+ *
  * Commands:
  *   1=Mic1  2=Mic2  B=Both  C=Calibrate
  *   P=Serial Plotter mode (use Tools>Serial Plotter)
- *   W=WAV stream mode (use Python recorder script)
+ *   W=WAV stream mode (beamformed + noise reduced, always mono)
  *   D=Dashboard mode (default)
  *   H=Help
  */
 
 #include <driver/i2s.h>
 #include <math.h>
+#include <arduinoFFT.h>
 
 // ── Mic1 (I2S0) ──
 #define M1_SCK  5
@@ -42,6 +50,13 @@
 #define NOISE_MARGIN    1.5f
 #define DC_HP_ALPHA     0.995f
 #define SMOOTH_ALPHA    0.85f
+
+// ── FFT Noise Reduction ──
+#define FFT_SIZE        512
+#define FFT_HOP         (FFT_SIZE / 2)     // 256 samples, 50% overlap
+#define FFT_BINS        (FFT_SIZE / 2 + 1) // 257 unique magnitude bins
+#define OVERSUB_FACTOR  2.0f               // Noise oversubtraction (1.0=gentle, 4.0=aggressive)
+#define SPECTRAL_FLOOR  0.02f              // Minimum gain per bin (prevents musical noise)
 
 // ── Serial ──
 #define SERIAL_BAUD     2000000  // 2 Mbaud — needed for 44.1kHz stereo
@@ -71,6 +86,19 @@ char viewMode = 'D';   // D=Dashboard, P=Plotter, W=WAV
 int printCount = 0;
 bool wavActive = false;
 unsigned long wavStart = 0;
+
+// ── FFT Noise Reduction state ──
+float hannWindow[FFT_SIZE];
+float noiseSpectrum[FFT_BINS];         // Average noise magnitude per bin
+bool  noiseSpectrumReady = false;
+float vReal[FFT_SIZE];                 // FFT real part
+float vImag[FFT_SIZE];                 // FFT imaginary part
+float inputRing[FFT_SIZE];            // Accumulates HP-filtered mono samples
+int   inputRingPos = 0;
+float olaBuffer[FFT_HOP];             // Overlap-add tail from previous frame
+bool  olaFirstFrame = true;
+
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, FFT_SIZE, (float)SAMPLE_RATE);
 
 // ══════════════════════════════════════
 // I2S
@@ -159,6 +187,102 @@ void processMic(int32_t *raw, size_t totalSamples, Mic &m) {
 }
 
 // ══════════════════════════════════════
+// HP FILTER FOR WAV / FFT PIPELINE
+// ══════════════════════════════════════
+
+// HP filter helper — removes DC offset, returns float for FFT pipeline
+static inline float applyWavHP(float x, Mic &m) {
+  if (!m.wavHpReady) {
+    m.wavHpPrev = x; m.wavHpOut = 0; m.wavHpReady = true;
+    return 0;
+  }
+  float hp = DC_HP_ALPHA * (m.wavHpOut + x - m.wavHpPrev);
+  m.wavHpPrev = x; m.wavHpOut = hp;
+  return hp;
+}
+
+// ══════════════════════════════════════
+// FFT UTILITIES
+// ══════════════════════════════════════
+
+void initHannWindow() {
+  for (int i = 0; i < FFT_SIZE; i++)
+    hannWindow[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / FFT_SIZE));
+}
+
+// Process one FFT frame: window → FFT → spectral subtraction → IFFT → overlap-add
+// Returns number of output samples written to outBuf
+int processFFTFrame(float *frame, int16_t *outBuf) {
+  // Apply Hann window
+  for (int i = 0; i < FFT_SIZE; i++) {
+    vReal[i] = frame[i] * hannWindow[i];
+    vImag[i] = 0;
+  }
+
+  // Forward FFT
+  FFT.compute(FFTDirection::Forward);
+
+  // Spectral subtraction using calibrated noise profile
+  if (noiseSpectrumReady) {
+    // DC bin (no mirror)
+    {
+      float mag = fabsf(vReal[0]);
+      if (mag > 0) {
+        float clean = mag - OVERSUB_FACTOR * noiseSpectrum[0];
+        if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
+        vReal[0] *= clean / mag;
+      }
+    }
+    // Nyquist bin (no mirror)
+    {
+      float mag = fabsf(vReal[FFT_SIZE / 2]);
+      if (mag > 0) {
+        float clean = mag - OVERSUB_FACTOR * noiseSpectrum[FFT_SIZE / 2];
+        if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
+        vReal[FFT_SIZE / 2] *= clean / mag;
+      }
+    }
+    // Bins 1..N/2-1 with conjugate mirrors
+    for (int b = 1; b < FFT_SIZE / 2; b++) {
+      float re = vReal[b], im = vImag[b];
+      float mag = sqrtf(re * re + im * im);
+      if (mag > 0) {
+        float clean = mag - OVERSUB_FACTOR * noiseSpectrum[b];
+        if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
+        float gain = clean / mag;
+        vReal[b] *= gain;
+        vImag[b] *= gain;
+        // Mirror (conjugate symmetry for real signal)
+        vReal[FFT_SIZE - b] = vReal[b];
+        vImag[FFT_SIZE - b] = -vImag[b];
+      }
+    }
+  }
+
+  // Inverse FFT
+  FFT.compute(FFTDirection::Reverse);
+
+  // Overlap-add: combine first half with previous frame's tail
+  int outCount = 0;
+  if (!olaFirstFrame) {
+    for (int i = 0; i < FFT_HOP; i++) {
+      float s = vReal[i] + olaBuffer[i];
+      if (s >  32767.0f) s =  32767.0f;
+      if (s < -32768.0f) s = -32768.0f;
+      outBuf[outCount++] = (int16_t)s;
+    }
+  } else {
+    olaFirstFrame = false;
+  }
+
+  // Save current frame's tail for next overlap
+  for (int i = 0; i < FFT_HOP; i++)
+    olaBuffer[i] = vReal[i + FFT_HOP];
+
+  return outCount;
+}
+
+// ══════════════════════════════════════
 // CALIBRATION
 // ══════════════════════════════════════
 
@@ -200,6 +324,69 @@ void calibrate() {
 
   float ratio = (mic2.calNoiseRMS > 0) ? mic1.calNoiseRMS / mic2.calNoiseRMS : 999;
   if (ratio > 5) Serial.printf("  [WARN] M1 is %.0fx noisier than M2\n", ratio);
+
+  // ── Build noise magnitude spectrum for FFT-based noise reduction ──
+  Serial.println("  Computing noise spectrum...");
+  for (int b = 0; b < FFT_BINS; b++) noiseSpectrum[b] = 0;
+  int specFrames = 0;
+  int specPos = 0;
+
+  // Reset WAV HP filters for clean state
+  mic1.wavHpPrev = 0; mic1.wavHpOut = 0; mic1.wavHpReady = false;
+  mic2.wavHpPrev = 0; mic2.wavHpOut = 0; mic2.wavHpReady = false;
+
+  // Let HP filter settle (5 reads ≈ 60ms)
+  for (int r = 0; r < 5; r++) {
+    size_t n1 = readMic(I2S_NUM_0, raw1);
+    size_t n2 = readMic(I2S_NUM_1, raw2);
+    size_t maxN = max(n1, n2);
+    for (size_t i = 0; i < maxN; i += 2) {
+      if (i < n1) applyWavHP((float)(raw1[i] >> 16), mic1);
+      if (i < n2) applyWavHP((float)(raw2[i] >> 16), mic2);
+    }
+  }
+
+  // Collect noise frames (25 reads ≈ 0.3s of noise)
+  for (int r = 0; r < 25; r++) {
+    size_t n1 = readMic(I2S_NUM_0, raw1);
+    size_t n2 = readMic(I2S_NUM_1, raw2);
+    size_t maxN = max(n1, n2);
+
+    for (size_t i = 0; i < maxN; i += 2) {
+      float hp1 = (float)applyWavHP((float)(raw1[i] >> 16), mic1);
+      float hp2 = (float)applyWavHP((float)(raw2[i] >> 16), mic2);
+      float mono = (hp1 + hp2) * 0.5f;
+
+      inputRing[specPos++] = mono;
+
+      if (specPos == FFT_SIZE) {
+        // Window and FFT
+        for (int k = 0; k < FFT_SIZE; k++) {
+          vReal[k] = inputRing[k] * hannWindow[k];
+          vImag[k] = 0;
+        }
+        FFT.compute(FFTDirection::Forward);
+
+        // Accumulate magnitudes
+        for (int b = 0; b < FFT_BINS; b++)
+          noiseSpectrum[b] += sqrtf(vReal[b] * vReal[b] + vImag[b] * vImag[b]);
+        specFrames++;
+
+        // 50% overlap shift
+        for (int k = 0; k < FFT_HOP; k++)
+          inputRing[k] = inputRing[k + FFT_HOP];
+        specPos = FFT_HOP;
+      }
+    }
+  }
+
+  // Average the noise spectrum
+  if (specFrames > 0) {
+    for (int b = 0; b < FFT_BINS; b++)
+      noiseSpectrum[b] /= specFrames;
+    noiseSpectrumReady = true;
+    Serial.printf("  Noise spectrum: %d frames averaged\n", specFrames);
+  }
   Serial.println();
 }
 
@@ -298,42 +485,34 @@ void modePlotter() {
 }
 
 // ══════════════════════════════════════
-// MODE W: WAV STREAM
-// Sends raw 16-bit PCM over serial.
-// Python script captures and saves as .wav
-// Protocol: SYNC_WORD(4) + LEN(2) + PCM_DATA(LEN*2)
+// MODE W: WAV STREAM (Beamformed + NR)
+// HP filter → Average both mics → FFT →
+// Spectral subtraction → IFFT → OLA → Serial
+// Output: clean mono 16-bit PCM
 // ══════════════════════════════════════
 
 void startWavStream() {
   wavActive = true;
   wavStart = millis();
 
-  // Reset WAV HP filter state for clean start
+  // Reset WAV HP filter state
   mic1.wavHpPrev = 0; mic1.wavHpOut = 0; mic1.wavHpReady = false;
   mic2.wavHpPrev = 0; mic2.wavHpOut = 0; mic2.wavHpReady = false;
+
+  // Reset FFT / overlap-add state
+  inputRingPos = 0;
+  olaFirstFrame = true;
+  for (int i = 0; i < FFT_HOP; i++) olaBuffer[i] = 0;
+  for (int i = 0; i < FFT_SIZE; i++) inputRing[i] = 0;
 
   Serial.println("WAV_START");
   Serial.printf("RATE:%d\n", SAMPLE_RATE);
   Serial.printf("BITS:16\n");
-  Serial.printf("CHANNELS:%d\n", (mode == 'B') ? 2 : 1);
+  Serial.printf("CHANNELS:1\n");  // Always mono (beamformed + noise reduced)
   Serial.printf("DURATION:%d\n", WAV_DURATION_S);
   Serial.println("DATA_BEGIN");
   Serial.flush();
   delay(50);
-}
-
-// HP filter helper for WAV mode — removes DC offset for clean audio
-static inline int16_t applyWavHP(float x, Mic &m) {
-  if (!m.wavHpReady) {
-    m.wavHpPrev = x; m.wavHpOut = 0; m.wavHpReady = true;
-    return 0;
-  }
-  float hp = DC_HP_ALPHA * (m.wavHpOut + x - m.wavHpPrev);
-  m.wavHpPrev = x; m.wavHpOut = hp;
-  // Clamp to int16 range
-  if (hp >  32767.0f) hp =  32767.0f;
-  if (hp < -32768.0f) hp = -32768.0f;
-  return (int16_t)hp;
 }
 
 void modeWavStream() {
@@ -351,32 +530,36 @@ void modeWavStream() {
     return;
   }
 
-  bool s1 = (mode=='B' || mode=='1'), s2 = (mode=='B' || mode=='2');
+  // Always read both mics for beamforming
+  size_t n1 = readMic(I2S_NUM_0, raw1);
+  size_t n2 = readMic(I2S_NUM_1, raw2);
 
-  // Read from active mic(s)
-  size_t n1 = 0, n2 = 0;
-  if (s1) n1 = readMic(I2S_NUM_0, raw1);
-  if (s2) n2 = readMic(I2S_NUM_1, raw2);
-
-  // Convert to 16-bit, apply HP filter, and send in one bulk write
-  static int16_t sendBuf[BUF_SAMPLES];  // Reusable output buffer
-  size_t outCount = 0;
-
+  static int16_t sendBuf[FFT_HOP];
   size_t maxN = max(n1, n2);
+
   for (size_t i = 0; i < maxN; i += 2) {
-    if (s1 && i < n1) {
-      float x = (float)(raw1[i] >> 16);
-      sendBuf[outCount++] = applyWavHP(x, mic1);
-    }
-    if (s2 && i < n2) {
-      float x = (float)(raw2[i] >> 16);
-      sendBuf[outCount++] = applyWavHP(x, mic2);
+    // HP filter each mic
+    float hp1 = applyWavHP((float)(raw1[i] >> 16), mic1);
+    float hp2 = (i < n2) ? applyWavHP((float)(raw2[i] >> 16), mic2) : hp1;
+
+    // Beamform: average both mics (coherent speech +6dB, incoherent noise +3dB)
+    float mono = (hp1 + hp2) * 0.5f;
+
+    // Accumulate into frame buffer
+    inputRing[inputRingPos++] = mono;
+
+    // When frame is full, process through FFT noise reduction
+    if (inputRingPos == FFT_SIZE) {
+      int nOut = processFFTFrame(inputRing, sendBuf);
+      if (nOut > 0)
+        Serial.write((uint8_t*)sendBuf, nOut * 2);
+
+      // 50% overlap: shift second half to first half
+      for (int k = 0; k < FFT_HOP; k++)
+        inputRing[k] = inputRing[k + FFT_HOP];
+      inputRingPos = FFT_HOP;
     }
   }
-
-  // Bulk write — much faster than sample-by-sample
-  if (outCount > 0)
-    Serial.write((uint8_t*)sendBuf, outCount * 2);
 }
 
 // ══════════════════════════════════════
@@ -404,9 +587,8 @@ void handleCommands() {
     }
     if (c=='W') {
       viewMode='W';
-      Serial.printf("\n  >> WAV stream: %d sec, %d Hz, %s\n",
-                    WAV_DURATION_S, SAMPLE_RATE,
-                    (mode=='B') ? "stereo" : "mono");
+      Serial.printf("\n  >> WAV stream: %d sec, %d Hz, mono (beamformed + NR)\n",
+                    WAV_DURATION_S, SAMPLE_RATE);
       Serial.println("  >> Start Python recorder, then send any key...\n");
       // Wait for go signal
       while (!Serial.available()) delay(10);
@@ -444,6 +626,7 @@ void setup() {
   Serial.println("  ║  [D]ash [P]lot [W]av [C]al [1][2][B] [H]elp ║");
   Serial.println("  ╚═══════════════════════════════════════════════╝");
 
+  initHannWindow();
   calibrate();
 }
 

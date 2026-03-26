@@ -1,0 +1,6 @@
+{
+    "files.watcherExclude": {
+        "**/managed_components/**": true,
+        "**/.pio/**": true
+    }
+}

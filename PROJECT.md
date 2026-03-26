@@ -1,8 +1,27 @@
 # MOSA_MIC_PROJ
 
-**Microphone Open Sound Architecture - Dual INMP441 Recording System**
+**Microphone Open Sound Architecture - Dual INMP441 Beamformed Noise Reduction System**
 
-A dual-microphone audio capture and analysis system built on the Seeed Studio XIAO ESP32-S3. It records CD-quality WAV files from two INMP441 MEMS microphones, streams real-time audio metrics, and provides signal processing tools for noise-robust measurement.
+A dual-microphone audio capture and noise reduction system built on the Seeed Studio XIAO ESP32-S3 using **ESP-IDF** with **hardware-accelerated DSP**. It uses two side-by-side INMP441 MEMS microphones with beamforming and FFT-based spectral subtraction to extract clean speech from noisy environments, recording the result as a CD-quality mono WAV file.
+
+---
+
+## Framework
+
+| | |
+|---|---|
+| **Framework** | ESP-IDF (via PlatformIO) |
+| **DSP Library** | esp-dsp (hardware-accelerated FFT on ESP32-S3) |
+| **Build System** | PlatformIO + CMake |
+| **Previous** | Arduino IDE (migrated 2026-03-26) |
+
+### Why ESP-IDF over Arduino?
+
+- **Hardware-accelerated FFT** via esp-dsp — uses ESP32-S3 vector DSP extensions
+- **Direct FreeRTOS** control — task priorities, dual-core utilization
+- **Full ESP-IDF API** — USB Serial/JTAG driver, precise timers, GPIO config
+- **No abstraction overhead** — direct register access when needed
+- **Better memory alignment** — `__attribute__((aligned(16)))` for DSP buffers
 
 ---
 
@@ -10,10 +29,11 @@ A dual-microphone audio capture and analysis system built on the Seeed Studio XI
 
 | Component | Details |
 |-----------|---------|
-| **MCU** | Seeed Studio XIAO ESP32-S3 |
+| **MCU** | Seeed Studio XIAO ESP32-S3 (240 MHz dual-core, FPU, 512 KB SRAM) |
 | **Mic 1** | INMP441 MEMS (I2S0) |
 | **Mic 2** | INMP441 MEMS (I2S1) |
-| **Interface** | USB Serial at 2 Mbaud |
+| **Mic Position** | Side-by-side in one package |
+| **Interface** | USB Serial/JTAG (native USB, no external UART chip) |
 
 ### Pin Mapping
 
@@ -33,58 +53,73 @@ A dual-microphone audio capture and analysis system built on the Seeed Studio XI
 | Sample Rate | 44,100 Hz (CD quality) |
 | Bit Depth | 16-bit signed PCM |
 | I2S Resolution | 32-bit (downsampled to 16-bit) |
-| Channels | Mono (Mic1 or Mic2) or Stereo (both) |
+| Output Channels | Mono (beamformed from both mics) |
 | Clock Source | APLL (hardware PLL for precise timing) |
 | DMA Buffers | 8 x 512 samples |
 | Read Buffer | 1024 samples per cycle |
+| FFT Size | 512 samples, 50% overlap (Hann window) |
+| FFT Engine | esp-dsp `dsps_fft2r_fc32` (hardware accelerated) |
 | Output Format | Standard WAV (RIFF) |
 
 ---
 
-## Signal Processing Pipeline
+## Noise Reduction Pipeline (WAV Mode)
 
 ```
-INMP441 Mic ──► I2S (32-bit) ──► Downsample (>>16) ──► HP Filter ──► Output
-                                                           │
-                                                    DC offset removal
-                                                    (alpha = 0.995)
+Mic1 --> I2S (32-bit) --> >>16 --> HP Filter --+
+                                               +--> Average --> FFT --> Spectral --> IFFT --> OLA --> Clean
+Mic2 --> I2S (32-bit) --> >>16 --> HP Filter --+  (beamform)  (HW)   Subtraction   (HW)           Mono WAV
+                                                                          ^
+                                                                   Noise spectrum
+                                                                 (from calibration)
 ```
 
-### Processing Features
+### Processing Stages
 
-- **High-Pass Filter** -- First-order IIR (alpha=0.995) removes DC offset for clean audio
+1. **I2S Capture** -- 32-bit samples from each INMP441, downsampled to 16-bit
+2. **HP Filter** -- First-order IIR (alpha=0.995) removes DC offset per mic
+3. **Beamforming** -- Average both mics: coherent speech adds +6 dB, incoherent noise adds +3 dB = **+3 dB SNR gain**
+4. **FFT** -- 512-point Hann-windowed FFT via `dsps_fft2r_fc32` (hardware accelerated)
+   - Data format: interleaved complex `[re0, im0, re1, im1, ...]`
+   - 16-byte aligned buffers for SIMD performance
+5. **Spectral Subtraction** -- Subtract calibrated noise magnitude spectrum per bin
+   - Oversubtraction factor: 2.0x (configurable, 1.0=gentle, 4.0=aggressive)
+   - Spectral floor: 2% (prevents musical noise artifacts)
+   - Phase preserved from original signal
+   - Conjugate mirror symmetry maintained
+6. **IFFT** -- Inverse via conjugate + forward FFT + normalize (hardware accelerated)
+7. **Overlap-Add** -- 50% overlap with Hann window for seamless reconstruction
+8. **Output** -- Clean mono 16-bit PCM streamed via USB Serial/JTAG
+
+### Dashboard Mode Processing
+
 - **RMS Calculation** -- AC component power measurement
 - **Peak Detection** -- Absolute peak tracking per buffer
-- **Noise Gate** -- Threshold-based voice activity detection (calibrated noise floor x 1.5)
+- **Noise Gate** -- Threshold-based voice activity detection (noise floor x 1.5)
 - **SNR Metering** -- Real-time signal-to-noise ratio in dB
 - **Exponential Smoothing** -- Smooth AC level display (alpha=0.85)
-- **Calibration** -- 80-round silence measurement to establish noise floor and DC offset
+
+### Calibration
+
+Runs automatically on boot and on `C` command. Requires silence.
+
+1. **Time-domain calibration** (80 rounds) -- measures noise RMS, peak, DC offset per mic
+2. **Spectral calibration** (25 reads + 5 settling) -- computes average noise magnitude spectrum across ~40 FFT frames using hardware-accelerated FFT
 
 ---
 
 ## Operating Modes
 
-Interactive serial commands switch between modes:
-
 | Command | Mode | Description |
 |:-------:|------|-------------|
-| `1` | Mic 1 | Monitor/record single microphone |
-| `2` | Mic 2 | Monitor/record second microphone |
-| `B` | Both | Stereo monitoring/recording |
+| `1` | Mic 1 | Monitor single microphone (dashboard/plotter) |
+| `2` | Mic 2 | Monitor second microphone (dashboard/plotter) |
+| `B` | Both | Monitor both mics (dashboard/plotter) |
 | `D` | Dashboard | Live metrics with level bars (default) |
-| `P` | Plotter | CSV output for Arduino Serial Plotter |
-| `W` | WAV Stream | Binary PCM recording to PC |
-| `C` | Calibrate | Noise floor calibration (requires silence) |
+| `P` | Plotter | CSV output for serial plotter tools |
+| `W` | WAV Stream | Beamformed + noise-reduced mono recording |
+| `C` | Calibrate | Noise floor + spectrum calibration (requires silence) |
 | `H` | Help | Show command reference |
-
-### Dashboard Mode (D)
-Displays a live table with gate status, DC offset, HP-filtered RMS, smoothed level, SNR (dB), peak range, and a visual level bar for each active mic.
-
-### Plotter Mode (P)
-Outputs HP-filtered samples as CSV for the Arduino IDE Serial Plotter. Decimated (every 8th sample) to avoid flooding the serial link.
-
-### WAV Stream Mode (W)
-Streams HP-filtered 16-bit PCM over serial using a binary protocol. A companion Python script captures and saves as `.wav`.
 
 ---
 
@@ -95,14 +130,12 @@ ESP32 sends:
   "WAV_START\n"
   "RATE:44100\n"
   "BITS:16\n"
-  "CHANNELS:2\n"        (or 1 for mono)
+  "CHANNELS:1\n"          (always mono -- beamformed + noise reduced)
   "DURATION:10\n"
   "DATA_BEGIN\n"
-  <binary 16-bit PCM samples, little-endian>
+  <binary 16-bit PCM, little-endian, noise-reduced>
   "\nDATA_END\n"
 ```
-
-The HP filter is applied during WAV streaming to remove DC offset, producing clean recordings without post-processing.
 
 ---
 
@@ -110,79 +143,93 @@ The HP filter is applied during WAV streaming to remove DC offset, producing cle
 
 ```
 MOSA_MIC_PROJ/
-  ├── MOSA_MIC_PROJ.ino      ESP32-S3 firmware (Arduino C++)
-  ├── wav_recorder.py         PC-side WAV capture script (Python)
-  ├── mic_test.py             XIAO RP2040 intensity test (MicroPython)
-  ├── PROJECT.md              This file
-  ├── Test_voice/             WAV recordings output folder
-  └── mic test_wrongs/        Early test recordings (16 kHz, pre-HP filter)
+  ├── platformio.ini          PlatformIO config (ESP-IDF framework)
+  ├── sdkconfig.defaults      ESP-IDF settings (USB console, CPU freq, DSP)
+  ├── src/
+  │   ├── main.cpp            ESP-IDF firmware (C++)
+  │   ├── CMakeLists.txt      Build config for main component
+  │   └── idf_component.yml   esp-dsp dependency declaration
+  ├── include/                 Header files (empty for now)
+  ├── MOSA_MIC_PROJ.ino        Legacy Arduino firmware (reference)
+  ├── wav_recorder.py          PC-side WAV capture script (Python)
+  ├── mic_test.py              XIAO RP2040 intensity test (MicroPython)
+  ├── PROJECT.md               This file
+  ├── README.md                GitHub readme
+  ├── Test_voice/              Clean WAV recordings output folder
+  └── mic test_wrongs/         Early test recordings (16 kHz, pre-NR)
 ```
 
-### MOSA_MIC_PROJ.ino
-Main firmware. Configures dual I2S interfaces, runs calibration on boot, handles serial commands, and implements all operating modes including HP-filtered WAV streaming.
+### src/main.cpp
+Main ESP-IDF firmware. Uses `driver/i2s.h` for dual I2S, `driver/usb_serial_jtag.h` for serial I/O, `dsps_fft2r.h` / `dsps_wind_hann.h` for hardware-accelerated FFT and Hann window generation. FreeRTOS-based with `app_main()` entry point.
 
 ### wav_recorder.py
-Python companion script that connects to the ESP32 via serial, triggers WAV mode, captures the binary PCM stream, and writes a standard WAV file with progress display.
+Python companion script. Unchanged from Arduino version -- the serial protocol is identical.
 
 ```bash
-# Record both mics, 10 seconds (default)
-python wav_recorder.py
-
-# Mic 2 only, 5 seconds, specific port
-python wav_recorder.py --mic 2 --dur 5 --port COM5
+python wav_recorder.py                          # Both mics, 10 sec
+python wav_recorder.py --mic B --dur 20         # 20 seconds
+python wav_recorder.py --port COM5 --dur 15     # Specific port
 ```
 
-**CLI Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | Auto-detect | Serial port (e.g. COM3) |
-| `--mic` | `B` | `1`, `2`, or `B` (both/stereo) |
-| `--dur` | `10` | Recording duration in seconds |
-
-**Output:** `Test_voice/rec_YYYYMMDD_HHMMSS_[MIC1|MIC2|BOTH]_[mono|stereo]_44100Hz.wav`
-
-### mic_test.py
-MicroPython script for XIAO RP2040. Reads a single INMP441 mic via I2S, computes mean absolute intensity, and visualizes it on the onboard NeoPixel LED with color-mapped brightness.
+**Output:** `Test_voice/rec_YYYYMMDD_HHMMSS_[MIC1|MIC2|BOTH]_mono_44100Hz.wav`
 
 ---
 
 ## Dependencies
 
-### Firmware (Arduino IDE)
-- **Board**: `esp32` by Espressif (Board Manager)
-- **Board Selection**: Seeed Studio XIAO ESP32-S3
-- **Libraries**: `driver/i2s.h` (included with ESP32 core), `math.h`
-- **Serial Monitor Baud**: 2,000,000
+### Firmware (PlatformIO + ESP-IDF)
+- **PlatformIO** with `espressif32` platform
+- **Framework**: ESP-IDF (configured in `platformio.ini`)
+- **Components**:
+  - `espressif/esp-dsp ~1.4` (declared in `src/idf_component.yml`)
+  - `driver/i2s.h` (ESP-IDF built-in)
+  - `driver/usb_serial_jtag.h` (ESP-IDF built-in)
 
 ### Python (PC)
 - **Python** 3.7+
 - **pyserial**: `pip install pyserial`
-- **wave**: Standard library (no install needed)
+- **wave**: Standard library
 
 ---
 
 ## Quick Start
 
-1. **Wire** two INMP441 microphones to the ESP32-S3 per the pin mapping above
-2. **Flash** `MOSA_MIC_PROJ.ino` via Arduino IDE (select XIAO ESP32-S3, baud 2000000)
-3. **Open Serial Monitor** at 2,000,000 baud -- calibration runs automatically
-4. **Calibrate** in silence by sending `C`
-5. **Record**: Close Serial Monitor, then run:
+1. **Wire** two INMP441 microphones to the ESP32-S3 per the pin mapping
+2. **Open** the project folder in VS Code with PlatformIO extension
+3. **Build**: PlatformIO will auto-download ESP-IDF and esp-dsp
+4. **Upload**: Flash to XIAO ESP32-S3
+5. **Monitor**: Open serial monitor at 2,000,000 baud -- calibration runs on boot (keep silent!)
+6. **Record**: Close monitor, then:
    ```bash
    python wav_recorder.py
    ```
-6. **Play** the output WAV file -- it opens automatically on Windows
 
 ---
 
-## Recording Tips
+## Tuning the Noise Reduction
 
-- Always **calibrate** (`C`) before recording -- it measures your noise floor
-- Keep mics **away from the ESP32 board** to avoid electrical noise pickup
-- Use a **shielded USB cable** -- cheap cables introduce noise at 2 Mbaud
-- If 2 Mbaud causes serial errors, lower `SERIAL_BAUD` to `1500000` in both `.ino` and `.py`
-- For the cleanest recordings, ensure a **quiet environment** during calibration
+| Parameter | Default | Range | Effect |
+|-----------|---------|-------|--------|
+| `OVERSUB_FACTOR` | 2.0 | 1.0 - 4.0 | Higher = more noise removed but more speech distortion |
+| `SPECTRAL_FLOOR` | 0.02 | 0.001 - 0.1 | Higher = less musical noise but more residual noise |
+| `FFT_SIZE` | 512 | 256 / 512 / 1024 | Larger = better frequency resolution but more latency |
+
+---
+
+## ESP-IDF API Mapping (from Arduino)
+
+| Arduino | ESP-IDF | Notes |
+|---------|---------|-------|
+| `Serial.begin()` | `usb_serial_jtag_driver_install()` | Native USB, no baud rate needed |
+| `Serial.printf()` | `serial_printf()` (custom wrapper) | Uses `usb_serial_jtag_write_bytes` |
+| `Serial.write()` | `serial_write_bytes()` | Direct binary write |
+| `Serial.available()` | `serial_available()` | Peek-based implementation |
+| `Serial.read()` | `serial_read()` | Non-blocking with peek |
+| `delay(ms)` | `vTaskDelay(pdMS_TO_TICKS(ms))` | FreeRTOS tick-based |
+| `millis()` | `esp_timer_get_time() / 1000` | Microsecond timer |
+| `pinMode()` | `gpio_set_direction()` | ESP-IDF GPIO driver |
+| `digitalWrite()` | `gpio_set_level()` | Direct register write |
+| `arduinoFFT` | `dsps_fft2r_fc32()` | Hardware accelerated on ESP32-S3 |
 
 ---
 
@@ -192,4 +239,6 @@ MicroPython script for XIAO RP2040. Reads a single INMP441 mic via I2S, computes
 |------|--------|
 | 2026-03-23 | Initial dual-mic system with dashboard, plotter, WAV streaming at 16 kHz |
 | 2026-03-26 | Upgraded to 44.1 kHz, APLL clock, HP filter on WAV output, 2 Mbaud serial |
-| 2026-03-26 | WAV output to `Test_voice/` folder; filename includes mic source (MIC1/MIC2/BOTH) |
+| 2026-03-26 | WAV output to `Test_voice/` folder; filename includes mic source |
+| 2026-03-26 | Added FFT-based noise reduction: beamforming + spectral subtraction + OLA |
+| 2026-03-26 | Migrated from Arduino IDE to ESP-IDF (PlatformIO); esp-dsp HW-accelerated FFT |

@@ -1,0 +1,18 @@
+# ── CPU ──
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+
+# ── Console over USB Serial/JTAG (XIAO ESP32-S3 native USB) ──
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ── Stack ──
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ── Flash (XIAO ESP32-S3 has 8MB, but some boards report 2MB) ──
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# ── Suppress legacy I2S driver warnings ──
+CONFIG_I2S_SUPPRESS_DEPRECATE_WARN=y
+
+# ── DSP optimizations ──
+CONFIG_DSP_OPTIMIZED=y
+CONFIG_DSP_OPTIMIZATION=y

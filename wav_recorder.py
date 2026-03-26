@@ -48,63 +48,82 @@ def record(port, mic_mode='B', duration=10):
         print(f"  >> Close Serial Monitor first! <<")
         return
 
-    time.sleep(1.5)
+    # Wait for board to finish calibration after boot (~6 seconds)
+    print(f"  [0/4] Waiting for calibration to finish...")
+    time.sleep(6)
     ser.reset_input_buffer()
 
     # Set mic mode
     print(f"  [1/4] Setting mic: {mic_mode}")
     ser.write(mic_mode.encode())
-    time.sleep(0.5)
-    # Flush dashboard text
-    while ser.in_waiting:
-        ser.read(ser.in_waiting)
-        time.sleep(0.05)
+    time.sleep(0.3)
+    ser.reset_input_buffer()
 
-    # Send W
+    # Send W and immediately start reading (don't sleep!)
     print(f"  [2/4] Sending WAV command...")
     ser.write(b'W')
-    time.sleep(1.5)
 
     # Read response, send go signal when prompted
     print(f"  [3/4] Waiting for ESP32...")
-    sample_rate = 16000
+    sample_rate = 44100
     channels = 1
     started = False
+    go_sent = False
     timeout_t = time.time() + 20
+    buf = b''
 
     while time.time() < timeout_t:
-        if not ser.in_waiting:
+        avail = ser.in_waiting
+        if avail > 0:
+            buf += ser.read(avail)
+        elif not started:
             time.sleep(0.01)
             continue
 
-        try:
-            line = ser.readline().decode('utf-8', errors='replace').strip()
-        except:
-            continue
-        if not line:
-            continue
+        # Process complete lines from buffer
+        while b'\n' in buf:
+            idx = buf.index(b'\n')
+            raw_line = buf[:idx]
+            buf = buf[idx+1:]
 
-        if "send any key" in line or "Start Python" in line:
-            time.sleep(0.2)
-            ser.write(b'G')  # Go signal
-            continue
+            try:
+                line = raw_line.decode('utf-8', errors='replace').strip()
+            except:
+                continue
+            if not line:
+                continue
 
-        if line == "WAV_START":
-            pass
-        elif line.startswith("RATE:"):
-            sample_rate = int(line.split(":")[1])
-        elif line.startswith("CHANNELS:"):
-            channels = int(line.split(":")[1])
-        elif line.startswith("DURATION:"):
-            pass
-        elif line == "DATA_BEGIN":
-            started = True
+            # Debug: show what we receive
+            if not line.startswith((' M1', ' M2', '---', 'Mic', '===')):
+                print(f"         << {line}")
+
+            if not go_sent and ("send any key" in line.lower() or "start python" in line.lower()):
+                time.sleep(0.1)
+                ser.write(b'G')
+                go_sent = True
+                print(f"         >> Sent GO signal")
+                continue
+
+            if line == "WAV_START":
+                pass
+            elif line.startswith("RATE:"):
+                sample_rate = int(line.split(":")[1])
+            elif line.startswith("CHANNELS:"):
+                channels = int(line.split(":")[1])
+            elif line.startswith("DURATION:"):
+                pass
+            elif line == "DATA_BEGIN":
+                started = True
+                break
+
+        if started:
             break
 
     if not started:
         print("  [ERROR] Timeout — no DATA_BEGIN received")
-        print("  Did you upload the latest Arduino code?")
-        print("  Is Serial Monitor baud set to 921600?")
+        print("  Make sure the firmware is running (check serial monitor first).")
+        if not go_sent:
+            print("  The WAV prompt was never seen — board may still be calibrating.")
         ser.close()
         return
 

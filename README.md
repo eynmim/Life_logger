@@ -1,23 +1,42 @@
 # MOSA_MIC_PROJ
 
-### Dual INMP441 Microphone Recording System for ESP32-S3
+### Dual INMP441 Beamformed Noise Reduction System for ESP32-S3
 
-A real-time audio capture and analysis platform that records CD-quality stereo WAV files from two INMP441 MEMS microphones using the Seeed Studio XIAO ESP32-S3.
-
-Built for audio research, noise measurement, and embedded sound projects.
+A real-time voice extraction system that uses two side-by-side INMP441 MEMS microphones with beamforming and **hardware-accelerated FFT spectral subtraction** to isolate speech from environmental noise. Built on **ESP-IDF** with the **esp-dsp** library for maximum DSP performance on the ESP32-S3.
 
 ---
 
 ## Features
 
-- **Dual Microphone Capture** -- Two independent I2S buses, mono or stereo recording
+- **Hardware-Accelerated FFT** -- esp-dsp uses ESP32-S3 vector DSP extensions for fast FFT/IFFT
+- **Dual-Mic Beamforming** -- Averages both mics for +3 dB SNR improvement
+- **FFT Spectral Subtraction** -- Removes noise in the frequency domain using a calibrated noise profile
 - **CD-Quality Audio** -- 44.1 kHz, 16-bit PCM with hardware APLL clock
-- **HP-Filtered WAV Output** -- DC offset removal applied during recording for clean files
-- **Auto Calibration** -- Measures noise floor in silence, sets gate thresholds automatically
+- **ESP-IDF Native** -- Direct access to FreeRTOS, USB Serial/JTAG, and all ESP32-S3 hardware
+- **Auto Calibration** -- Measures noise floor + full noise spectrum in silence
+- **Clean Mono Output** -- Beamformed and noise-reduced WAV, ready to use
 - **Live Dashboard** -- Real-time RMS, SNR (dB), peak levels, and noise gate status
-- **Serial Plotter** -- CSV waveform output compatible with Arduino IDE Serial Plotter
-- **SNR Metering** -- Signal-to-noise ratio computed against calibrated noise floor
-- **One-Command Recording** -- Python script handles serial handshake, capture, and WAV save
+
+---
+
+## How It Works
+
+```
+Mic1 --> HP Filter --+
+                     +--> Average --> FFT --> Spectral --> IFFT --> OLA --> Clean Mono WAV
+Mic2 --> HP Filter --+  (beamform)  (HW)   Subtraction   (HW)
+                                                ^
+                                         Noise spectrum
+                                       (from calibration)
+```
+
+1. Both mics capture audio via separate I2S buses
+2. HP filter removes DC offset from each mic
+3. Signals are averaged (beamformed) -- speech adds constructively
+4. **esp-dsp hardware-accelerated** 512-point FFT transforms to frequency domain
+5. Calibrated noise magnitude is subtracted per frequency bin
+6. Hardware-accelerated IFFT + overlap-add reconstructs clean audio
+7. Result streams as mono 16-bit PCM to the Python recorder
 
 ---
 
@@ -34,53 +53,61 @@ Built for audio research, noise measurement, and embedded sound projects.
 
 ```
          INMP441 Mic 1              XIAO ESP32-S3            INMP441 Mic 2
-        ┌───────────┐              ┌─────────────┐           ┌───────────┐
-        │  SCK ─────┼──────────────┤ GPIO5       │           │           │
-        │  WS  ─────┼──────────────┤ GPIO43      │           │           │
-        │  SD  ─────┼──────────────┤ GPIO6       │           │           │
-        │  L/R ─────┼──────────────┤ GPIO44      │           │           │
-        │  VDD ─────┼──── 3.3V ───┤             │           │           │
-        │  GND ─────┼──── GND ────┤             ├── GPIO9 ──┼── SCK     │
-        └───────────┘              │             ├── GPIO7 ──┼── WS      │
-                                   │             ├── GPIO8 ──┼── SD      │
-                                   │             ├── GPIO4 ──┼── L/R     │
-                                   │             ├── 3.3V ───┼── VDD     │
-                                   │             ├── GND ────┼── GND     │
-                                   └─────────────┘           └───────────┘
+        +-------------+            +---------------+         +-------------+
+        |  SCK --------+------------| GPIO5         |         |             |
+        |  WS  --------+------------| GPIO43        |         |             |
+        |  SD  --------+------------| GPIO6         |         |             |
+        |  L/R --------+------------| GPIO44        |         |             |
+        |  VDD --------+--- 3.3V --+|               |         |             |
+        |  GND --------+--- GND ---+|               +- GPIO9 -+-- SCK       |
+        +-------------+            |               +- GPIO7 -+-- WS        |
+                                   |               +- GPIO8 -+-- SD        |
+                                   |               +- GPIO4 -+-- L/R       |
+                                   |               +- 3.3V --+-- VDD       |
+                                   |               +- GND ---+-- GND       |
+                                   +---------------+         +-------------+
 ```
 
-> Set both L/R pins LOW for left-channel data on each I2S bus.
+> Place both mics **side-by-side**, close together, facing the speaker. Set both L/R pins LOW.
 
 ---
 
 ## Getting Started
 
-### 1. Flash the Firmware
+### 1. Install PlatformIO
 
-- Open `MOSA_MIC_PROJ.ino` in Arduino IDE
-- Install the **esp32** board package (by Espressif) via Board Manager
-- Select board: **XIAO ESP32-S3**
-- Set Serial Monitor baud to **2,000,000**
-- Upload
+- Install [VS Code](https://code.visualstudio.com/)
+- Install the [PlatformIO extension](https://platformio.org/install/ide?install=vscode)
 
-### 2. Calibrate
+### 2. Open and Build
 
-Open Serial Monitor. Calibration runs automatically on boot. For best results, recalibrate in silence:
+- Open the `MOSA_MIC_PROJ/` folder in VS Code
+- PlatformIO will auto-detect `platformio.ini` and download:
+  - ESP-IDF framework
+  - esp-dsp component (from `src/idf_component.yml`)
+- Click **Build** (checkmark icon) or run `pio run`
 
-```
-Send: C
-```
+### 3. Flash
 
-### 3. Record a WAV
+- Connect the XIAO ESP32-S3 via USB-C
+- Click **Upload** (arrow icon) or run `pio run -t upload`
 
-Close Serial Monitor first, then:
+### 4. Calibrate
+
+- Open PlatformIO Serial Monitor (2,000,000 baud)
+- Calibration runs automatically on boot -- **keep silent!**
+- To recalibrate: send `C`
+
+### 5. Record a Clean WAV
+
+Close the serial monitor, then:
 
 ```bash
 pip install pyserial
 python wav_recorder.py
 ```
 
-Output: `Test_voice/rec_20260326_143022_BOTH_stereo_44100Hz.wav`
+Output: `Test_voice/rec_20260326_143022_BOTH_mono_44100Hz.wav`
 
 ---
 
@@ -90,73 +117,39 @@ Output: `Test_voice/rec_20260326_143022_BOTH_stereo_44100Hz.wav`
 
 | Key | Action |
 |:---:|--------|
-| `1` | Select Mic 1 only |
-| `2` | Select Mic 2 only |
-| `B` | Select Both (stereo) |
+| `1` | Select Mic 1 (dashboard/plotter only) |
+| `2` | Select Mic 2 (dashboard/plotter only) |
+| `B` | Select Both (dashboard/plotter only) |
 | `D` | Dashboard mode -- live metrics table |
-| `P` | Plotter mode -- CSV for Serial Plotter |
-| `W` | WAV stream mode -- binary PCM to PC |
-| `C` | Calibrate -- run in silence |
+| `P` | Plotter mode -- CSV output |
+| `W` | WAV stream -- beamformed + noise reduced, always mono |
+| `C` | Calibrate -- run in silence! |
 | `H` | Help |
 
 ### Python Recorder
 
 ```bash
-# Both mics, 10 seconds, auto-detect port
-python wav_recorder.py
-
-# Mic 1 only, 20 seconds
-python wav_recorder.py --mic 1 --dur 20
-
-# Specific port
-python wav_recorder.py --port COM5 --mic B --dur 15
+python wav_recorder.py                      # Record 10 sec
+python wav_recorder.py --port COM5 --dur 20 # Specific port, 20 sec
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--port` | Auto | Serial port (COM3, /dev/ttyUSB0, etc.) |
-| `--mic` | `B` | `1`, `2`, or `B` (both) |
+| `--port` | Auto | Serial port |
+| `--mic` | `B` | `1`, `2`, or `B` -- used in filename label |
 | `--dur` | `10` | Duration in seconds |
 
-### Dashboard Output Example
-
-```
-═══ BOTH ═══  [1][2][B] [C]al [P]lot [W]av [H]elp
-Mic │ Gate │ DC(raw)│ HP RMS│Smooth│  SNR  │ Min~Max │ Level
-────┼──────┼────────┼───────┼──────┼───────┼─────────┼─────────
- M1 │ OPEN │  -12   │  847  │  790 │ 18.3dB│ -2041~ 1876│ ######---
- M2 │ shut │   -8   │   45  │   42 │  0.2dB│   -98~   87│ ---------
-```
-
 ---
 
-## Audio Specs
+## Tuning the Noise Reduction
 
-| Parameter | Value |
-|-----------|-------|
-| Sample Rate | 44,100 Hz |
-| Bit Depth | 16-bit signed PCM |
-| Clock | APLL (hardware PLL) |
-| HP Filter | First-order IIR, alpha=0.995 |
-| Noise Gate | Calibrated RMS x 1.5 margin |
-| Serial Baud | 2,000,000 |
-| WAV Format | Standard RIFF/WAV |
+Edit these defines in `src/main.cpp`:
 
----
-
-## Signal Processing
-
-```
-Mic ──► I2S (32-bit) ──► >>16 (to 16-bit) ──► HP Filter ──► WAV / Dashboard
-                                                   │
-                                            Removes DC offset
-                                            Prevents "muffled" audio
-```
-
-- **HP Filter** removes DC bias from the MEMS microphone output
-- **Calibration** measures noise floor RMS, peak, and DC offset over 80 rounds
-- **Noise Gate** suppresses output when signal is below threshold
-- **SNR** is computed as `20 * log10(signal_RMS / noise_RMS)` in dB
+| Parameter | Default | Effect |
+|-----------|:-------:|--------|
+| `OVERSUB_FACTOR` | 2.0 | Higher = more noise removed, may distort speech |
+| `SPECTRAL_FLOOR` | 0.02 | Higher = less musical noise artifacts |
+| `FFT_SIZE` | 512 | 256 = less latency, 1024 = better frequency resolution |
 
 ---
 
@@ -164,13 +157,20 @@ Mic ──► I2S (32-bit) ──► >>16 (to 16-bit) ──► HP Filter ──
 
 ```
 MOSA_MIC_PROJ/
-├── MOSA_MIC_PROJ.ino      # ESP32-S3 firmware (Arduino C++)
-├── wav_recorder.py         # PC recording script (Python 3)
-├── mic_test.py             # XIAO RP2040 single-mic test (MicroPython)
-├── PROJECT.md              # Detailed technical documentation
-├── README.md               # This file
-├── Test_voice/             # WAV recordings output folder
-└── mic test_wrongs/        # Early test recordings (16 kHz)
++-- platformio.ini          # PlatformIO config (ESP-IDF framework)
++-- sdkconfig.defaults      # ESP-IDF settings
++-- src/
+|   +-- main.cpp            # ESP-IDF firmware with esp-dsp
+|   +-- CMakeLists.txt      # Build config
+|   +-- idf_component.yml   # esp-dsp dependency
++-- include/                # Header files
++-- MOSA_MIC_PROJ.ino       # Legacy Arduino version (reference)
++-- wav_recorder.py         # PC recording script (Python 3)
++-- mic_test.py             # XIAO RP2040 test (MicroPython)
++-- PROJECT.md              # Detailed technical docs
++-- README.md               # This file
++-- Test_voice/             # Clean WAV recordings output
++-- mic test_wrongs/        # Early test recordings
 ```
 
 ---
@@ -178,9 +178,9 @@ MOSA_MIC_PROJ/
 ## Dependencies
 
 **Firmware:**
-- Arduino IDE 2.x
-- ESP32 board package by Espressif
-- No external libraries required
+- PlatformIO with `espressif32` platform
+- ESP-IDF framework (auto-downloaded by PlatformIO)
+- `espressif/esp-dsp` component (auto-downloaded from ESP Component Registry)
 
 **Python:**
 - Python 3.7+
@@ -188,15 +188,30 @@ MOSA_MIC_PROJ/
 
 ---
 
+## Arduino vs ESP-IDF
+
+| Feature | Arduino | ESP-IDF (current) |
+|---------|---------|-------------------|
+| FFT | arduinoFFT (software) | esp-dsp (hardware accelerated) |
+| Serial | Arduino Serial class | USB Serial/JTAG driver |
+| Tasks | single loop() | FreeRTOS app_main |
+| GPIO | pinMode/digitalWrite | gpio_set_direction/level |
+| Timer | millis() | esp_timer_get_time() |
+| Build | Arduino IDE | PlatformIO + CMake |
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| No serial port found | Close Arduino Serial Monitor before running `wav_recorder.py` |
-| Garbled audio / clicks | Use a shielded USB cable; try lowering baud to `1500000` in both files |
-| High noise on one mic | Check wiring; run calibration (`C`); check the WARN message |
-| Short/empty WAV file | Increase `--dur`; ensure baud rates match between firmware and Python |
-| `DATA_BEGIN` timeout | Re-flash firmware; verify board is XIAO ESP32-S3 |
+| PlatformIO can't find board | Ensure `espressif32` platform is installed |
+| `dsps_fft2r.h` not found | Check `src/idf_component.yml` exists with esp-dsp dependency |
+| No serial output | Set monitor speed to 2000000 in PlatformIO |
+| Speech sounds "underwater" | Lower `OVERSUB_FACTOR` to 1.5 |
+| Musical noise / chirping | Increase `SPECTRAL_FLOOR` to 0.05 |
+| High noise remains | Recalibrate (`C`) in silence |
+| USB not detected | Try different USB-C cable; ensure it's data-capable |
 
 ---
 
@@ -208,4 +223,4 @@ MIT
 
 ## Acknowledgments
 
-Built with the Seeed Studio XIAO ESP32-S3 and InvenSense INMP441 MEMS microphones.
+Built with the Seeed Studio XIAO ESP32-S3, InvenSense INMP441 MEMS microphones, and Espressif's esp-dsp library.
