@@ -114,6 +114,7 @@ MOSA_MIC_PROJ/
   ├── wav_recorder.py         PC-side WAV capture script (Python)
   ├── mic_test.py             XIAO RP2040 intensity test (MicroPython)
   ├── PROJECT.md              This file
+  ├── Test_voice/             WAV recordings output folder
   └── mic test_wrongs/        Early test recordings (16 kHz, pre-HP filter)
 ```
 
@@ -139,7 +140,7 @@ python wav_recorder.py --mic 2 --dur 5 --port COM5
 | `--mic` | `B` | `1`, `2`, or `B` (both/stereo) |
 | `--dur` | `10` | Recording duration in seconds |
 
-**Output:** `rec_YYYYMMDD_HHMMSS_[mono|stereo]_44100Hz.wav`
+**Output:** `Test_voice/rec_YYYYMMDD_HHMMSS_[MIC1|MIC2|BOTH]_[mono|stereo]_44100Hz.wav`
 
 ### mic_test.py
 MicroPython script for XIAO RP2040. Reads a single INMP441 mic via I2S, computes mean absolute intensity, and visualizes it on the onboard NeoPixel LED with color-mapped brightness.
@@ -191,3 +192,4 @@ MicroPython script for XIAO RP2040. Reads a single INMP441 mic via I2S, computes
 |------|--------|
 | 2026-03-23 | Initial dual-mic system with dashboard, plotter, WAV streaming at 16 kHz |
 | 2026-03-26 | Upgraded to 44.1 kHz, APLL clock, HP filter on WAV output, 2 Mbaud serial |
+| 2026-03-26 | WAV output to `Test_voice/` folder; filename includes mic source (MIC1/MIC2/BOTH) |

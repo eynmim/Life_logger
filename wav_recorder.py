@@ -162,10 +162,13 @@ def record(port, mic_mode='B', duration=10):
         print("\n  [ERROR] No audio data captured!")
         return
 
-    # Save
+    # Save to Test_voice folder
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"rec_{timestamp}_{ch_label}_{sample_rate}Hz.wav"
-    filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    mic_label = "BOTH" if mic_mode == 'B' else f"MIC{mic_mode}"
+    filename = f"rec_{timestamp}_{mic_label}_{ch_label}_{sample_rate}Hz.wav"
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Test_voice")
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, filename)
 
     with wave.open(filepath, 'w') as wf:
         wf.setnchannels(channels)
