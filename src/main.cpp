@@ -1,108 +1,66 @@
 /*
- * MOSA_MIC_PROJ — ESP-IDF Native
+ * MOSA_MIC_PROJ — Tier 2: High-Quality Voice Engine
  * ================================================================
- * Dual INMP441 Beamformed Noise Reduction System
- * XIAO ESP32-S3 with hardware-accelerated DSP
+ * Dual INMP441 microphones on XIAO ESP32-S3
+ * ESP-SR AFE_VC HIGH_PERF + NSNet + VADNet + AGC + BSS
  *
- * Pipeline (WAV mode):
- *   Mic1 + Mic2 → HP filter → Beamform (average) →
- *   FFT (esp-dsp HW accel) → Spectral Subtraction →
- *   IFFT → Overlap-Add → Clean mono WAV
+ * Audio Enhancement Pipeline:
+ *   I2S (16kHz) → ESP-SR AFE_VC HIGH_PERF [BSS + NSNet + VADNet + AGC]
+ *     → Coherence-based Wiener filter (dual-mic diffuse noise rejection)
+ *     → MMSE-LSA residual noise suppression
+ *     → Spectral tilt EQ (INMP441 compensation)
+ *     → Formant enhancement (LPC post-filter)
+ *     → Clean mono PCM → Ring buffer → Output
+ *
+ * Architecture:
+ *   Core 1: AFE feed (I2S → interleave → AFE) + AFE fetch (clean → post-proc → RB)
+ *   Core 0: Serial CLI, dashboard, plotter, WAV streaming
  *
  * Mic1 (I2S0): SCK=GPIO5  WS=GPIO43 SD=GPIO6  L/R=GPIO44
  * Mic2 (I2S1): SCK=GPIO9  WS=GPIO7  SD=GPIO8  L/R=GPIO4
- *
- * Framework: ESP-IDF (PlatformIO)
- * DSP:       esp-dsp (hardware-accelerated FFT on ESP32-S3)
  */
 
 #include <cstdio>
 #include <cstring>
-#include <cstdarg>
 #include <cmath>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s.h"
 #include "driver/gpio.h"
-#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
-// esp-dsp: hardware-accelerated FFT on ESP32-S3
-#include "dsps_fft2r.h"
-#include "dsps_wind_hann.h"
+// ESP-SR AFE
+#include "esp_afe_sr_iface.h"
+#include "esp_afe_sr_models.h"
+
+// Modules
+#include "config/device_config.h"
+#include "config/cal_store.h"
+#include "hal/serial_io.h"
+#include "audio/audio_buffer.h"
+#include "audio/post_processor.h"
+#include "audio/coherence_filter.h"
+#include "audio/vad.h"
 
 static const char *TAG = "MOSA";
 
 // ══════════════════════════════════════
-// PIN DEFINITIONS
-// ══════════════════════════════════════
-
-// Mic1 (I2S0)
-#define M1_SCK  GPIO_NUM_5
-#define M1_WS   GPIO_NUM_43
-#define M1_SD   GPIO_NUM_6
-#define M1_LR   GPIO_NUM_44
-
-// Mic2 (I2S1)
-#define M2_SCK  GPIO_NUM_9
-#define M2_WS   GPIO_NUM_7
-#define M2_SD   GPIO_NUM_8
-#define M2_LR   GPIO_NUM_4
-
-// ══════════════════════════════════════
-// AUDIO CONFIGURATION
-// ══════════════════════════════════════
-
-#define SAMPLE_RATE     44100
-#define DMA_BUF_COUNT   8
-#define DMA_BUF_LEN     512
-#define BUF_SAMPLES     1024
-
-// ══════════════════════════════════════
-// CALIBRATION
-// ══════════════════════════════════════
-
-#define CAL_ROUNDS      80
-#define CAL_SKIP        20
-#define NOISE_MARGIN    1.5f
-#define DC_HP_ALPHA     0.995f
-#define SMOOTH_ALPHA    0.85f
-
-// ══════════════════════════════════════
-// FFT NOISE REDUCTION (esp-dsp accelerated)
-// ══════════════════════════════════════
-
-#define FFT_SIZE        512
-#define FFT_HOP         (FFT_SIZE / 2)      // 256 samples, 50% overlap
-#define FFT_BINS        (FFT_SIZE / 2 + 1)  // 257 unique magnitude bins
-#define OVERSUB_FACTOR  2.0f                // Noise oversubtraction (1.0=gentle, 4.0=aggressive)
-#define SPECTRAL_FLOOR  0.02f               // Minimum gain per bin (prevents musical noise)
-
-// ══════════════════════════════════════
-// SERIAL / TIMING
-// ══════════════════════════════════════
-
-#define WAV_DURATION_S  10
-
-// ══════════════════════════════════════
-// I2S RAW BUFFERS
+// I2S RAW BUFFERS (for calibration only)
 // ══════════════════════════════════════
 
 static int32_t raw1[BUF_SAMPLES];
 static int32_t raw2[BUF_SAMPLES];
 
 // ══════════════════════════════════════
-// PER-MIC STATE
+// PER-MIC STATE (dashboard display)
 // ══════════════════════════════════════
 
 struct Mic {
     float hpPrev, hpOut;
     bool  hpReady;
-    // WAV-mode HP filter (separate from dashboard HP)
-    float wavHpPrev, wavHpOut;
-    bool  wavHpReady;
     float calNoiseRMS, calNoisePeak, calDC, gateThreshold, gain;
     bool  calibrated;
     float rawDC, acRMS, acPeak, smoothAC;
@@ -112,83 +70,38 @@ struct Mic {
 };
 
 static Mic mic1 = {}, mic2 = {};
-static char mode = 'B';       // 1, 2, B
-static char viewMode = 'D';   // D=Dashboard, P=Plotter, W=WAV
+static char mode = 'B';
+static char viewMode = 'D';
 static int printCount = 0;
 static bool wavActive = false;
+static bool wavABMode = false;   // true = stereo A/B (ch1=raw, ch2=processed)
 static int64_t wavStartUs = 0;
 
 // ══════════════════════════════════════
-// FFT NOISE REDUCTION STATE
+// ESP-SR AFE STATE
 // ══════════════════════════════════════
 
-// esp-dsp uses interleaved complex: [re0, im0, re1, im1, ...]
-static float __attribute__((aligned(16))) fftData[FFT_SIZE * 2];
-static float hannWindow[FFT_SIZE];
-static float noiseSpectrum[FFT_BINS];
-static bool  noiseSpectrumReady = false;
-static float inputRing[FFT_SIZE];
-static int   inputRingPos = 0;
-static float olaBuffer[FFT_HOP];
-static bool  olaFirstFrame = true;
+static const esp_afe_sr_iface_t *afe_handle = NULL;
+static esp_afe_sr_data_t *afe_data = NULL;
+static int afe_feed_chunksize = 0;
+static int afe_feed_nch = 0;
+static int afe_fetch_chunksize = 0;
+static volatile bool afe_running = false;
+
+// Dashboard snapshots from feed task
+static volatile float snap_m1_rms = 0, snap_m2_rms = 0;
+static volatile float snap_m1_peak = 0, snap_m2_peak = 0;
+static volatile float snap_m1_dc = 0, snap_m2_dc = 0;
+static volatile int16_t snap_m1_min = 0, snap_m1_max = 0;
+static volatile int16_t snap_m2_min = 0, snap_m2_max = 0;
+
+// Raw mic snapshots for coherence filter
+static int16_t *snap_raw_m1 = NULL;
+static int16_t *snap_raw_m2 = NULL;
+static volatile int snap_raw_len = 0;
 
 // ══════════════════════════════════════
-// SERIAL I/O (USB Serial/JTAG)
-// ══════════════════════════════════════
-
-static int s_peek = -1;
-
-static void serial_init() {
-    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    cfg.tx_buffer_size = 32768;
-    cfg.rx_buffer_size = 1024;
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
-}
-
-static void serial_print(const char *str) {
-    usb_serial_jtag_write_bytes(str, strlen(str), pdMS_TO_TICKS(200));
-}
-
-static void serial_printf(const char *fmt, ...) {
-    static char buf[512];
-    va_list args;
-    va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (len > 0)
-        usb_serial_jtag_write_bytes(buf, len, pdMS_TO_TICKS(200));
-}
-
-static void serial_write_bytes(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t *)data;
-    while (len > 0) {
-        int sent = usb_serial_jtag_write_bytes(p, len, pdMS_TO_TICKS(1000));
-        if (sent > 0) { p += sent; len -= sent; }
-        else vTaskDelay(1);
-    }
-}
-
-static void serial_flush() {
-    vTaskDelay(pdMS_TO_TICKS(20));
-}
-
-static bool serial_available() {
-    if (s_peek >= 0) return true;
-    uint8_t c;
-    int n = usb_serial_jtag_read_bytes(&c, 1, 0);
-    if (n > 0) { s_peek = c; return true; }
-    return false;
-}
-
-static int serial_read() {
-    if (s_peek >= 0) { int c = s_peek; s_peek = -1; return c; }
-    uint8_t c;
-    int n = usb_serial_jtag_read_bytes(&c, 1, pdMS_TO_TICKS(10));
-    return (n > 0) ? (int)c : -1;
-}
-
-// ══════════════════════════════════════
-// MILLIS HELPER
+// HELPERS
 // ══════════════════════════════════════
 
 static inline uint32_t millis() {
@@ -209,7 +122,7 @@ static void setup_i2s(i2s_port_t port, int sck, int ws, int sd) {
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count        = DMA_BUF_COUNT;
     cfg.dma_buf_len          = DMA_BUF_LEN;
-    cfg.use_apll             = true;
+    cfg.use_apll             = false;
     cfg.tx_desc_auto_clear   = false;
     cfg.fixed_mclk           = 0;
 
@@ -237,23 +150,20 @@ static size_t read_mic(i2s_port_t port, int32_t *buf) {
 }
 
 // ══════════════════════════════════════
-// HP FILTER
+// CALIBRATION (with NVS persistence)
 // ══════════════════════════════════════
 
 static void process_mic(int32_t *raw, size_t totalSamples, Mic &m) {
     if (totalSamples < 2) return;
-
     m.rawMin = 32767; m.rawMax = -32768;
     float dcSum = 0, sqSum = 0, peakAbs = 0;
     size_t count = 0;
-
     for (size_t i = 0; i < totalSamples; i += 2) {
         int16_t s = (int16_t)(raw[i] >> 16);
         float x = (float)s;
         dcSum += x;
         if (s < m.rawMin) m.rawMin = s;
         if (s > m.rawMax) m.rawMax = s;
-
         float hp;
         if (!m.hpReady) {
             m.hpPrev = x; m.hpOut = 0; m.hpReady = true; hp = 0;
@@ -261,164 +171,35 @@ static void process_mic(int32_t *raw, size_t totalSamples, Mic &m) {
             hp = DC_HP_ALPHA * (m.hpOut + x - m.hpPrev);
             m.hpPrev = x; m.hpOut = hp;
         }
-
         float absHP = fabsf(hp);
         sqSum += hp * hp;
         if (absHP > peakAbs) peakAbs = absHP;
         count++;
     }
     if (count == 0) return;
-
     m.rawDC  = dcSum / count;
     m.acRMS  = sqrtf(sqSum / count);
     m.acPeak = peakAbs;
-
     if (m.smoothAC == 0) m.smoothAC = m.acRMS;
     else m.smoothAC = SMOOTH_ALPHA * m.smoothAC + (1.0f - SMOOTH_ALPHA) * m.acRMS;
-
     if (m.calibrated) {
         m.active = (m.smoothAC > m.gateThreshold);
-        m.snr    = (m.calNoiseRMS > 0) ? 20.0f * log10f(m.acRMS / m.calNoiseRMS) : 0;
+        m.snr = (m.calNoiseRMS > 0) ? 20.0f * log10f(m.acRMS / m.calNoiseRMS) : 0;
     } else {
         m.active = (m.acRMS > 100);
-        m.snr    = 0;
+        m.snr = 0;
     }
 }
 
-// WAV-mode HP filter — returns float for FFT pipeline
-static inline float apply_wav_hp(float x, Mic &m) {
-    if (!m.wavHpReady) {
-        m.wavHpPrev = x; m.wavHpOut = 0; m.wavHpReady = true;
-        return 0;
-    }
-    float hp = DC_HP_ALPHA * (m.wavHpOut + x - m.wavHpPrev);
-    m.wavHpPrev = x; m.wavHpOut = hp;
-    return hp;
-}
-
-// ══════════════════════════════════════
-// FFT UTILITIES (esp-dsp hardware accelerated)
-// ══════════════════════════════════════
-
-static void init_dsp() {
-    // Initialize esp-dsp FFT twiddle factors for our FFT size
-    esp_err_t ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "FFT init failed: %s", esp_err_to_name(ret));
-    }
-
-    // Generate Hann window using esp-dsp
-    dsps_wind_hann_f32(hannWindow, FFT_SIZE);
-}
-
-// Forward FFT using esp-dsp (hardware accelerated on ESP32-S3)
-static void fft_forward(float *data) {
-    dsps_fft2r_fc32(data, FFT_SIZE);
-    dsps_bit_rev_fc32(data, FFT_SIZE);
-}
-
-// Inverse FFT: conjugate → forward FFT → conjugate + normalize
-static void fft_inverse(float *data) {
-    // Conjugate (negate imaginary parts)
-    for (int i = 0; i < FFT_SIZE; i++)
-        data[2 * i + 1] = -data[2 * i + 1];
-
-    // Forward FFT
-    dsps_fft2r_fc32(data, FFT_SIZE);
-    dsps_bit_rev_fc32(data, FFT_SIZE);
-
-    // Conjugate and normalize by 1/N
-    float inv_n = 1.0f / FFT_SIZE;
-    for (int i = 0; i < FFT_SIZE; i++) {
-        data[2 * i]     *=  inv_n;
-        data[2 * i + 1] *= -inv_n;
-    }
-}
-
-// Process one FFT frame: window → FFT → spectral subtraction → IFFT → overlap-add
-// Returns number of output samples written to outBuf
-static int process_fft_frame(float *frame, int16_t *outBuf) {
-    // Pack into interleaved complex: [re, im, re, im, ...]
-    for (int i = 0; i < FFT_SIZE; i++) {
-        fftData[2 * i]     = frame[i] * hannWindow[i];  // real
-        fftData[2 * i + 1] = 0;                         // imaginary
-    }
-
-    // Forward FFT (hardware accelerated)
-    fft_forward(fftData);
-
-    // Spectral subtraction using calibrated noise profile
-    if (noiseSpectrumReady) {
-        // DC bin (index 0, no mirror)
-        {
-            float mag = fabsf(fftData[0]);
-            if (mag > 0) {
-                float clean = mag - OVERSUB_FACTOR * noiseSpectrum[0];
-                if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
-                fftData[0] *= clean / mag;
-            }
-        }
-        // Nyquist bin (index N/2, no mirror)
-        {
-            int idx = FFT_SIZE / 2;
-            float re = fftData[2 * idx], im = fftData[2 * idx + 1];
-            float mag = sqrtf(re * re + im * im);
-            if (mag > 0) {
-                float clean = mag - OVERSUB_FACTOR * noiseSpectrum[idx];
-                if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
-                float g = clean / mag;
-                fftData[2 * idx]     *= g;
-                fftData[2 * idx + 1] *= g;
-            }
-        }
-        // Bins 1..N/2-1 with conjugate mirrors
-        for (int b = 1; b < FFT_SIZE / 2; b++) {
-            float re = fftData[2 * b], im = fftData[2 * b + 1];
-            float mag = sqrtf(re * re + im * im);
-            if (mag > 0) {
-                float clean = mag - OVERSUB_FACTOR * noiseSpectrum[b];
-                if (clean < mag * SPECTRAL_FLOOR) clean = mag * SPECTRAL_FLOOR;
-                float g = clean / mag;
-                // Apply gain
-                fftData[2 * b]     *= g;
-                fftData[2 * b + 1] *= g;
-                // Mirror (conjugate symmetry for real signal)
-                int m = FFT_SIZE - b;
-                fftData[2 * m]     =  fftData[2 * b];
-                fftData[2 * m + 1] = -fftData[2 * b + 1];
-            }
-        }
-    }
-
-    // Inverse FFT (hardware accelerated)
-    fft_inverse(fftData);
-
-    // Overlap-add: combine first half with previous frame's tail
-    int outCount = 0;
-    if (!olaFirstFrame) {
-        for (int i = 0; i < FFT_HOP; i++) {
-            float s = fftData[2 * i] + olaBuffer[i];  // real part only
-            if (s >  32767.0f) s =  32767.0f;
-            if (s < -32768.0f) s = -32768.0f;
-            outBuf[outCount++] = (int16_t)s;
-        }
-    } else {
-        olaFirstFrame = false;
-    }
-
-    // Save current frame's tail for next overlap
-    for (int i = 0; i < FFT_HOP; i++)
-        olaBuffer[i] = fftData[2 * (i + FFT_HOP)];  // real part
-
-    return outCount;
-}
-
-// ══════════════════════════════════════
-// CALIBRATION
-// ══════════════════════════════════════
-
-static void calibrate() {
+static void calibrate(bool save_to_nvs) {
     serial_print("\n  Calibrating — SILENCE PLEASE!\n");
+
+    bool was_running = afe_running;
+    if (was_running) {
+        afe_running = false;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     mic1 = {}; mic2 = {};
 
     for (int i = 0; i < CAL_SKIP; i++) {
@@ -453,77 +234,326 @@ static void calibrate() {
     serial_printf("  M2: NoiseRMS=%.0f  Peak=%.0f  DC=%.0f  Gate=%.0f\n",
                   mic2.calNoiseRMS, mP2, mic2.calDC, mic2.gateThreshold);
 
-    float ratio = (mic2.calNoiseRMS > 0) ? mic1.calNoiseRMS / mic2.calNoiseRMS : 999;
-    if (ratio > 5) serial_printf("  [WARN] M1 is %.0fx noisier than M2\n", ratio);
-
-    // ── Build noise magnitude spectrum (esp-dsp accelerated FFT) ──
-    serial_print("  Computing noise spectrum...\n");
-    for (int b = 0; b < FFT_BINS; b++) noiseSpectrum[b] = 0;
-    int specFrames = 0;
-    int specPos = 0;
-
-    mic1.wavHpPrev = 0; mic1.wavHpOut = 0; mic1.wavHpReady = false;
-    mic2.wavHpPrev = 0; mic2.wavHpOut = 0; mic2.wavHpReady = false;
-
-    // Let HP filter settle
-    for (int r = 0; r < 5; r++) {
-        size_t n1 = read_mic(I2S_NUM_0, raw1);
-        size_t n2 = read_mic(I2S_NUM_1, raw2);
-        size_t maxN = (n1 > n2) ? n1 : n2;
-        for (size_t i = 0; i < maxN; i += 2) {
-            if (i < n1) apply_wav_hp((float)(raw1[i] >> 16), mic1);
-            if (i < n2) apply_wav_hp((float)(raw2[i] >> 16), mic2);
-        }
+    if (save_to_nvs) {
+        CalData cal = {
+            mic1.calNoiseRMS, mic1.calNoisePeak, mic1.calDC, mic1.gateThreshold,
+            mic2.calNoiseRMS, mic2.calNoisePeak, mic2.calDC, mic2.gateThreshold
+        };
+        cal_store_save(cal);
+        serial_print("  Calibration saved to NVS.\n");
     }
 
-    // Collect noise frames
-    for (int r = 0; r < 25; r++) {
-        size_t n1 = read_mic(I2S_NUM_0, raw1);
-        size_t n2 = read_mic(I2S_NUM_1, raw2);
-        size_t maxN = (n1 > n2) ? n1 : n2;
-
-        for (size_t i = 0; i < maxN; i += 2) {
-            float hp1 = apply_wav_hp((float)(raw1[i] >> 16), mic1);
-            float hp2 = (i < n2) ? apply_wav_hp((float)(raw2[i] >> 16), mic2) : hp1;
-            float mono = (hp1 + hp2) * 0.5f;
-
-            inputRing[specPos++] = mono;
-
-            if (specPos == FFT_SIZE) {
-                // Pack and window
-                for (int k = 0; k < FFT_SIZE; k++) {
-                    fftData[2 * k]     = inputRing[k] * hannWindow[k];
-                    fftData[2 * k + 1] = 0;
-                }
-                // Hardware-accelerated FFT
-                fft_forward(fftData);
-
-                // Accumulate magnitudes
-                for (int b = 0; b < FFT_BINS; b++) {
-                    float re = fftData[2 * b], im = fftData[2 * b + 1];
-                    noiseSpectrum[b] += sqrtf(re * re + im * im);
-                }
-                specFrames++;
-
-                // 50% overlap shift
-                for (int k = 0; k < FFT_HOP; k++)
-                    inputRing[k] = inputRing[k + FFT_HOP];
-                specPos = FFT_HOP;
-            }
-        }
-    }
-
-    if (specFrames > 0) {
-        for (int b = 0; b < FFT_BINS; b++)
-            noiseSpectrum[b] /= specFrames;
-        noiseSpectrumReady = true;
-        serial_printf("  Noise spectrum: %d frames (esp-dsp HW FFT)\n", specFrames);
-    }
     serial_print("\n");
+
+    if (was_running) {
+        afe_running = true;
+    }
+}
+
+static bool try_load_calibration() {
+    CalData cal;
+    if (!cal_store_load(cal)) return false;
+
+    mic1.calNoiseRMS   = cal.m1_noiseRMS;
+    mic1.calNoisePeak  = cal.m1_noisePeak;
+    mic1.calDC         = cal.m1_dc;
+    mic1.gateThreshold = cal.m1_gate;
+    mic1.gain          = 1.0f;
+    mic1.calibrated    = true;
+
+    mic2.calNoiseRMS   = cal.m2_noiseRMS;
+    mic2.calNoisePeak  = cal.m2_noisePeak;
+    mic2.calDC         = cal.m2_dc;
+    mic2.gateThreshold = cal.m2_gate;
+    mic2.gain          = 1.0f;
+    mic2.calibrated    = true;
+
+    serial_printf("  Loaded cal from NVS: M1 gate=%.0f  M2 gate=%.0f\n",
+                  mic1.gateThreshold, mic2.gateThreshold);
+    return true;
 }
 
 // ══════════════════════════════════════
-// MODE D: DASHBOARD
+// AFE FEED TASK (Core 1)
+// ══════════════════════════════════════
+
+static void afe_feed_task(void *arg) {
+    int total_feed = afe_feed_chunksize * afe_feed_nch;
+    int16_t *feed_buf = (int16_t *)heap_caps_malloc(
+        total_feed * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int32_t *i2s_buf1 = (int32_t *)heap_caps_malloc(
+        afe_feed_chunksize * 2 * sizeof(int32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int32_t *i2s_buf2 = (int32_t *)heap_caps_malloc(
+        afe_feed_chunksize * 2 * sizeof(int32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    // Buffers for raw mic samples (for coherence filter)
+    int16_t *raw_m1_buf = (int16_t *)heap_caps_malloc(
+        afe_feed_chunksize * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *raw_m2_buf = (int16_t *)heap_caps_malloc(
+        afe_feed_chunksize * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!feed_buf || !i2s_buf1 || !i2s_buf2 || !raw_m1_buf || !raw_m2_buf) {
+        ESP_LOGE(TAG, "Failed to allocate feed buffers!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Store pointers for snapshot access
+    snap_raw_m1 = raw_m1_buf;
+    snap_raw_m2 = raw_m2_buf;
+
+    ESP_LOGI(TAG, "Feed task started: chunk=%d nch=%d", afe_feed_chunksize, afe_feed_nch);
+
+    while (afe_running) {
+        size_t bytes1 = 0, bytes2 = 0;
+        i2s_read(I2S_NUM_0, i2s_buf1, afe_feed_chunksize * 2 * sizeof(int32_t),
+                 &bytes1, pdMS_TO_TICKS(500));
+        i2s_read(I2S_NUM_1, i2s_buf2, afe_feed_chunksize * 2 * sizeof(int32_t),
+                 &bytes2, pdMS_TO_TICKS(500));
+
+        int samples1 = bytes1 / sizeof(int32_t);
+        int samples2 = bytes2 / sizeof(int32_t);
+
+        float dc1 = 0, dc2 = 0, sq1 = 0, sq2 = 0, pk1 = 0, pk2 = 0;
+        int16_t mn1 = 32767, mx1 = -32768, mn2 = 32767, mx2 = -32768;
+        int cnt = 0;
+
+        for (int i = 0; i < afe_feed_chunksize; i++) {
+            int idx = i * 2;
+            int16_t s1 = (idx < samples1) ? (int16_t)(i2s_buf1[idx] >> 16) : 0;
+            int16_t s2 = (idx < samples2) ? (int16_t)(i2s_buf2[idx] >> 16) : 0;
+
+            feed_buf[i * afe_feed_nch]     = s1;
+            feed_buf[i * afe_feed_nch + 1] = s2;
+
+            // Save raw samples for coherence filter
+            raw_m1_buf[i] = s1;
+            raw_m2_buf[i] = s2;
+
+            dc1 += s1; dc2 += s2;
+            sq1 += (float)s1 * s1; sq2 += (float)s2 * s2;
+            float a1 = fabsf((float)s1), a2 = fabsf((float)s2);
+            if (a1 > pk1) pk1 = a1;
+            if (a2 > pk2) pk2 = a2;
+            if (s1 < mn1) mn1 = s1;
+            if (s1 > mx1) mx1 = s1;
+            if (s2 < mn2) mn2 = s2;
+            if (s2 > mx2) mx2 = s2;
+            cnt++;
+        }
+
+        if (cnt > 0) {
+            snap_m1_dc = dc1 / cnt; snap_m2_dc = dc2 / cnt;
+            snap_m1_rms = sqrtf(sq1 / cnt); snap_m2_rms = sqrtf(sq2 / cnt);
+            snap_m1_peak = pk1; snap_m2_peak = pk2;
+            snap_m1_min = mn1; snap_m1_max = mx1;
+            snap_m2_min = mn2; snap_m2_max = mx2;
+            snap_raw_len = afe_feed_chunksize;
+        }
+
+        // Write raw mic1 to raw ring buffer (for A/B comparison)
+        rb_raw_write(raw_m1_buf, afe_feed_chunksize);
+
+        // Feed coherence filter with raw dual-mic data
+        coh_feed(raw_m1_buf, raw_m2_buf, afe_feed_chunksize);
+
+        // Feed AFE
+        afe_handle->feed(afe_data, feed_buf);
+    }
+
+    heap_caps_free(feed_buf);
+    heap_caps_free(i2s_buf1);
+    heap_caps_free(i2s_buf2);
+    heap_caps_free(raw_m1_buf);
+    heap_caps_free(raw_m2_buf);
+    snap_raw_m1 = NULL;
+    snap_raw_m2 = NULL;
+    ESP_LOGI(TAG, "Feed task stopped");
+    vTaskDelete(NULL);
+}
+
+// ══════════════════════════════════════
+// AFE FETCH TASK (Core 1)
+// Gets clean audio, applies post-processing, writes to ring buffer
+// ══════════════════════════════════════
+
+static void afe_fetch_task(void *arg) {
+    ESP_LOGI(TAG, "Fetch task started: chunk=%d", afe_fetch_chunksize);
+
+    while (afe_running) {
+        afe_fetch_result_t *res = afe_handle->fetch(afe_data);
+        if (!res || res->ret_value == ESP_FAIL || !res->data)
+            continue;
+
+        int nsamples = afe_fetch_chunksize;
+
+        // Update VAD state machine from AFE VAD output
+        vad_fsm_update(res->vad_state);
+
+        // Always write to pre-roll buffer (for VAD auto-record)
+        vad_preroll_write(res->data, nsamples);
+
+        // Apply coherence-based Wiener filter (uses raw dual-mic gain mask)
+        coh_apply(res->data, nsamples);
+
+        // Apply post-processing pipeline (EQ + MMSE-LSA + formant)
+        post_process(res->data, nsamples);
+
+        // Write to ring buffer
+        rb_write(res->data, nsamples);
+    }
+
+    ESP_LOGI(TAG, "Fetch task stopped");
+    vTaskDelete(NULL);
+}
+
+// ══════════════════════════════════════
+// AFE INITIALIZATION (HIGH PERFORMANCE)
+// ══════════════════════════════════════
+
+static void init_afe() {
+    serial_print("  Initializing ESP-SR AFE (HIGH_PERF)...\n");
+
+    // Ring buffers (processed + raw for A/B comparison)
+    rb_init(CLEAN_RB_SAMPLES);
+    rb_raw_init(CLEAN_RB_SAMPLES);
+
+    // Post-processing pipeline
+    post_init();
+    coh_init();
+    vad_fsm_init();
+
+    // Load models from flash
+    srmodel_list_t *models = esp_srmodel_init("model");
+    if (!models) {
+        ESP_LOGE(TAG, "Failed to load SR models from 'model' partition!");
+        serial_print("  [ERROR] Model partition empty — flash models first!\n");
+        return;
+    }
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║  AFE Configuration: HIGH PERFORMANCE Voice Communication    ║
+    // ║  BSS + NSNet + VADNet + AGC — maximum voice quality         ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // AFE_TYPE_VC: 1MIC + NSNet (neural noise suppression, ~15-20 dB)
+    // Note: 2MIC SR mode has BSS but no NSNet — net worse.
+    // VC selects first mic channel from "MM" input.
+    afe_config_t *cfg = afe_config_init("MM", models, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
+    if (!cfg) {
+        ESP_LOGE(TAG, "Failed to create AFE config!");
+        return;
+    }
+
+    // --- Noise Suppression: NSNet (neural, ~15-20 dB suppression) ---
+    cfg->ns_init = true;
+    cfg->afe_ns_mode = AFE_NS_MODE_NET;
+    cfg->ns_model_name = esp_srmodel_filter(models, "nsnet", NULL);
+    ESP_LOGI(TAG, "NS model selected: %s", cfg->ns_model_name ? cfg->ns_model_name : "NONE");
+
+    // --- Speech Enhancement / BSS: disabled (VC mode is 1MIC, BSS not available) ---
+    cfg->se_init = false;
+
+    // --- VAD: DNN-based (VADNet, trained on 15k hours) ---
+    cfg->vad_init = true;
+    cfg->vad_mode = VAD_MODE_2;             // Very aggressive noise rejection
+    cfg->vad_min_speech_ms = 200;           // 200ms minimum speech
+    cfg->vad_min_noise_ms = 800;            // 800ms minimum silence
+    cfg->vad_delay_ms = 128;                // Pre-roll cache in AFE
+
+    // --- AGC: DISABLED for clean A/B comparison ---
+    // AGC undoes noise suppression by boosting everything (incl. residual noise)
+    // Re-enable after A/B testing is validated
+    cfg->agc_init = false;
+
+    // --- WakeNet: disabled (not needed for voice recording) ---
+    cfg->wakenet_init = false;
+
+    // --- AEC: disabled (no speaker playback in recording device) ---
+    cfg->aec_init = false;
+
+    // --- General ---
+    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    cfg->afe_perferred_core = 1;
+    cfg->afe_linear_gain = 1.0f;            // Unity gain (AGC handles levels)
+
+    // Print BEFORE afe_config_check
+    serial_printf("  [PRE-CHECK]  NS:%s mode:%d  SE:%s  VAD:%s  AGC:%s\n",
+                  cfg->ns_init ? "ON" : "off",
+                  cfg->afe_ns_mode,
+                  cfg->se_init ? "ON" : "off",
+                  cfg->vad_init ? "ON" : "off",
+                  cfg->agc_init ? "ON" : "off");
+    if (cfg->ns_model_name)
+        serial_printf("  [PRE-CHECK]  NS model: %s\n", cfg->ns_model_name);
+
+    // Validate config (auto-resolves conflicts — MAY OVERRIDE SETTINGS!)
+    cfg = afe_config_check(cfg);
+
+    // Print AFTER afe_config_check — see what changed
+    serial_printf("  [POST-CHECK] NS:%s mode:%d  SE:%s  VAD:%s  AGC:%s\n",
+                  cfg->ns_init ? "ON" : "off",
+                  cfg->afe_ns_mode,
+                  cfg->se_init ? "ON" : "off",
+                  cfg->vad_init ? "ON" : "off",
+                  cfg->agc_init ? "ON" : "off");
+    if (cfg->ns_model_name)
+        serial_printf("  [POST-CHECK] NS model: %s\n", cfg->ns_model_name);
+    else
+        serial_print("  [POST-CHECK] NS model: NULL (no model loaded!)\n");
+
+    // Create AFE
+    afe_handle = esp_afe_handle_from_config(cfg);
+    if (!afe_handle) {
+        ESP_LOGE(TAG, "Failed to get AFE handle!");
+        afe_config_free(cfg);
+        return;
+    }
+
+    afe_data = afe_handle->create_from_config(cfg);
+    if (!afe_data) {
+        ESP_LOGE(TAG, "Failed to create AFE data!");
+        afe_config_free(cfg);
+        return;
+    }
+
+    afe_feed_chunksize  = afe_handle->get_feed_chunksize(afe_data);
+    afe_feed_nch        = afe_handle->get_feed_channel_num(afe_data);
+    afe_fetch_chunksize = afe_handle->get_fetch_chunksize(afe_data);
+
+    serial_printf("  AFE ready: feed_chunk=%d nch=%d fetch_chunk=%d\n",
+                  afe_feed_chunksize, afe_feed_nch, afe_fetch_chunksize);
+
+    // Debug: print what's actually enabled in the pipeline
+    serial_printf("  NS: %s (mode=%d)  SE: %s  VAD: %s  AGC: %s  AEC: %s\n",
+                  cfg->ns_init ? "ON" : "off",
+                  cfg->afe_ns_mode,
+                  cfg->se_init ? "ON" : "off",
+                  cfg->vad_init ? "ON" : "off",
+                  cfg->agc_init ? "ON" : "off",
+                  cfg->aec_init ? "ON" : "off");
+    if (cfg->ns_model_name)
+        serial_printf("  NS model: %s\n", cfg->ns_model_name);
+    else
+        serial_print("  NS model: (auto/default)\n");
+
+    afe_config_free(cfg);
+
+    serial_print("  VC mode: NSNet neural noise suppression active\n");
+
+    // Print the actual pipeline order (uses afe_data, not cfg)
+    afe_handle->print_pipeline(afe_data);
+
+    // Start tasks on Core 1
+    afe_running = true;
+    xTaskCreatePinnedToCore(afe_feed_task, "afe_feed", 8 * 1024, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 8 * 1024, NULL, 5, NULL, 1);
+
+    serial_print("  AFE + post-processing tasks started on Core 1\n");
+}
+
+// ══════════════════════════════════════
+// DASHBOARD
 // ══════════════════════════════════════
 
 static void print_bar(float value, float maxVal, int width) {
@@ -537,17 +567,46 @@ static void print_bar(float value, float maxVal, int width) {
     serial_print(bar);
 }
 
+static const char* vad_state_str() {
+    switch (vad_fsm_get_state()) {
+        case VAD_STATE_IDLE:        return "IDLE";
+        case VAD_STATE_PRE_SPEECH:  return "PRE ";
+        case VAD_STATE_SPEECH:      return "TALK";
+        case VAD_STATE_POST_SPEECH: return "HOLD";
+        default:                    return "????";
+    }
+}
+
 static void mode_dashboard() {
-    size_t n1 = read_mic(I2S_NUM_0, raw1);
-    size_t n2 = read_mic(I2S_NUM_1, raw2);
-    process_mic(raw1, n1, mic1);
-    process_mic(raw2, n2, mic2);
+    mic1.rawDC = snap_m1_dc; mic1.acRMS = snap_m1_rms; mic1.acPeak = snap_m1_peak;
+    mic1.rawMin = snap_m1_min; mic1.rawMax = snap_m1_max;
+    mic2.rawDC = snap_m2_dc; mic2.acRMS = snap_m2_rms; mic2.acPeak = snap_m2_peak;
+    mic2.rawMin = snap_m2_min; mic2.rawMax = snap_m2_max;
+
+    if (mic1.smoothAC == 0) mic1.smoothAC = mic1.acRMS;
+    else mic1.smoothAC = SMOOTH_ALPHA * mic1.smoothAC + (1.0f - SMOOTH_ALPHA) * mic1.acRMS;
+    if (mic2.smoothAC == 0) mic2.smoothAC = mic2.acRMS;
+    else mic2.smoothAC = SMOOTH_ALPHA * mic2.smoothAC + (1.0f - SMOOTH_ALPHA) * mic2.acRMS;
+
+    if (mic1.calibrated) {
+        mic1.active = (mic1.smoothAC > mic1.gateThreshold);
+        mic1.snr = (mic1.calNoiseRMS > 0) ? 20.0f * log10f(mic1.acRMS / mic1.calNoiseRMS) : 0;
+    }
+    if (mic2.calibrated) {
+        mic2.active = (mic2.smoothAC > mic2.gateThreshold);
+        mic2.snr = (mic2.calNoiseRMS > 0) ? 20.0f * log10f(mic2.acRMS / mic2.calNoiseRMS) : 0;
+    }
 
     bool s1 = (mode == 'B' || mode == '1'), s2 = (mode == 'B' || mode == '2');
 
     if (printCount % 25 == 0) {
         const char *mn = (mode == 'B') ? "BOTH" : (mode == '1') ? "MIC1" : "MIC2";
-        serial_printf("\n=== %s ===  [1][2][B] [C]al [P]lot [W]av [H]elp\n", mn);
+        serial_printf("\n=== %s === [AFE HIGH_PERF + NSNet + VADNet + AGC + Post]  VAD:%s\n", mn, vad_state_str());
+        serial_printf("  EQ:%s  MMSE:%s  Formant:%s  Coherence:%s\n",
+                      post_get_eq_enabled() ? "ON" : "off",
+                      post_get_mmse_enabled() ? "ON" : "off",
+                      post_get_formant_enabled() ? "ON" : "off",
+                      coh_get_enabled() ? "ON" : "off");
         serial_print("Mic | Gate | DC(raw)| HP RMS|Smooth|  SNR  | Min~Max | Level\n");
         serial_print("----+------+--------+-------+------+-------+---------+---------\n");
     }
@@ -577,68 +636,35 @@ static void mode_dashboard() {
 }
 
 // ══════════════════════════════════════
-// MODE P: SERIAL PLOTTER
+// PLOTTER (clean audio from post-processing)
 // ══════════════════════════════════════
 
 static void mode_plotter() {
-    size_t n1 = read_mic(I2S_NUM_0, raw1);
-    size_t n2 = read_mic(I2S_NUM_1, raw2);
-
-    static float hp1_prev = 0, hp1_out = 0;
-    static bool  hp1_ready = false;
-    static float hp2_prev = 0, hp2_out = 0;
-    static bool  hp2_ready = false;
-
-    bool s1 = (mode == 'B' || mode == '1'), s2 = (mode == 'B' || mode == '2');
-    int step = 8;
-
-    size_t minN = (n1 < n2) ? n1 : n2;
-    for (size_t i = 0; i < minN; i += 2 * step) {
-        int16_t s1_raw = (int16_t)(raw1[i] >> 16);
-        int16_t s2_raw = (int16_t)(raw2[i] >> 16);
-
-        float x1 = (float)s1_raw;
-        float h1;
-        if (!hp1_ready) { hp1_prev = x1; hp1_out = 0; hp1_ready = true; h1 = 0; }
-        else { h1 = DC_HP_ALPHA * (hp1_out + x1 - hp1_prev); hp1_prev = x1; hp1_out = h1; }
-
-        float x2 = (float)s2_raw;
-        float h2;
-        if (!hp2_ready) { hp2_prev = x2; hp2_out = 0; hp2_ready = true; h2 = 0; }
-        else { h2 = DC_HP_ALPHA * (hp2_out + x2 - hp2_prev); hp2_prev = x2; hp2_out = h2; }
-
-        if (s1 && s2)
-            serial_printf("%d,%d\n", (int)h1, (int)h2);
-        else if (s1)
-            serial_printf("%d\n", (int)h1);
-        else
-            serial_printf("%d\n", (int)h2);
+    int16_t buf[256];
+    int n = rb_read(buf, 256);
+    if (n > 0) {
+        int step = 8;
+        for (int i = 0; i < n; i += step)
+            serial_printf("%d\n", (int)buf[i]);
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 // ══════════════════════════════════════
-// MODE W: WAV STREAM (Beamformed + NR)
+// WAV STREAM
 // ══════════════════════════════════════
 
 static void start_wav_stream() {
     wavActive = true;
     wavStartUs = esp_timer_get_time();
-
-    // Reset HP filter state
-    mic1.wavHpPrev = 0; mic1.wavHpOut = 0; mic1.wavHpReady = false;
-    mic2.wavHpPrev = 0; mic2.wavHpOut = 0; mic2.wavHpReady = false;
-
-    // Reset FFT / OLA state
-    inputRingPos = 0;
-    olaFirstFrame = true;
-    memset(olaBuffer, 0, sizeof(olaBuffer));
-    memset(inputRing, 0, sizeof(inputRing));
-
+    rb_reset();
+    rb_raw_reset();
     serial_print("WAV_START\n");
     serial_printf("RATE:%d\n", SAMPLE_RATE);
     serial_print("BITS:16\n");
-    serial_print("CHANNELS:1\n");  // Always mono (beamformed + NR)
+    serial_printf("CHANNELS:%d\n", wavABMode ? 2 : 1);
     serial_printf("DURATION:%d\n", WAV_DURATION_S);
+    if (wavABMode) serial_print("MODE:AB\n");
     serial_print("DATA_BEGIN\n");
     serial_flush();
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -647,46 +673,43 @@ static void start_wav_stream() {
 static void mode_wav_stream() {
     if (!wavActive) return;
 
-    // Check timeout
     int64_t elapsed_us = esp_timer_get_time() - wavStartUs;
     if (elapsed_us > (int64_t)WAV_DURATION_S * 1000000LL) {
         serial_print("\nDATA_END\n");
         serial_flush();
         vTaskDelay(pdMS_TO_TICKS(50));
         wavActive = false;
+        wavABMode = false;
         viewMode = 'D';
         serial_printf("\n  WAV done (%d sec). Back to dashboard.\n\n", WAV_DURATION_S);
         return;
     }
 
-    // Always read both mics for beamforming
-    size_t n1 = read_mic(I2S_NUM_0, raw1);
-    size_t n2 = read_mic(I2S_NUM_1, raw2);
-
-    static int16_t sendBuf[FFT_HOP];
-    size_t maxN = (n1 > n2) ? n1 : n2;
-
-    for (size_t i = 0; i < maxN; i += 2) {
-        // HP filter each mic
-        float hp1 = apply_wav_hp((float)(raw1[i] >> 16), mic1);
-        float hp2 = (i < n2) ? apply_wav_hp((float)(raw2[i] >> 16), mic2) : hp1;
-
-        // Beamform: average (coherent speech +6dB, incoherent noise +3dB)
-        float mono = (hp1 + hp2) * 0.5f;
-
-        // Accumulate into frame buffer
-        inputRing[inputRingPos++] = mono;
-
-        // When frame is full → FFT noise reduction
-        if (inputRingPos == FFT_SIZE) {
-            int nOut = process_fft_frame(inputRing, sendBuf);
-            if (nOut > 0)
-                serial_write_bytes(sendBuf, nOut * 2);
-
-            // 50% overlap shift
-            for (int k = 0; k < FFT_HOP; k++)
-                inputRing[k] = inputRing[k + FFT_HOP];
-            inputRingPos = FFT_HOP;
+    if (wavABMode) {
+        // A/B stereo: interleave raw (ch1) + processed (ch2)
+        // Processed buffer is the bottleneck (AFE latency) — let it drive
+        int16_t raw_buf[256], proc_buf[256], stereo_buf[512];
+        int n_proc = rb_read(proc_buf, 256);
+        if (n_proc > 0) {
+            int n_raw = rb_raw_read(raw_buf, n_proc);
+            // Pad raw if it hasn't caught up yet
+            for (int i = n_raw; i < n_proc; i++) raw_buf[i] = 0;
+            for (int i = 0; i < n_proc; i++) {
+                stereo_buf[2 * i]     = raw_buf[i];   // Left = raw
+                stereo_buf[2 * i + 1] = proc_buf[i];  // Right = processed
+            }
+            serial_write_bytes(stereo_buf, n_proc * 2 * sizeof(int16_t));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    } else {
+        // Normal mono processed output
+        int16_t send_buf[512];
+        int n = rb_read(send_buf, 512);
+        if (n > 0) {
+            serial_write_bytes(send_buf, n * sizeof(int16_t));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
 }
@@ -700,50 +723,121 @@ static void handle_commands() {
         int raw = serial_read();
         if (raw < 0) break;
         char c = (char)raw;
-        if (c >= 'a' && c <= 'z') c -= 32;  // toupper
+        if (c >= 'a' && c <= 'z') c -= 32;
         if (c <= ' ') continue;
 
-        if (c == '1') { mode = '1'; printCount = 0; if (viewMode == 'D') serial_print("\n  >> Mic1\n\n"); }
-        if (c == '2') { mode = '2'; printCount = 0; if (viewMode == 'D') serial_print("\n  >> Mic2\n\n"); }
-        if (c == 'B') { mode = 'B'; printCount = 0; if (viewMode == 'D') serial_print("\n  >> Both\n\n"); }
-        if (c == 'C') { viewMode = 'D'; calibrate(); printCount = 0; }
-        if (c == 'D') {
-            viewMode = 'D'; printCount = 0; wavActive = false;
-            serial_print("\n  >> Dashboard mode\n\n");
-        }
-        if (c == 'P') {
-            viewMode = 'P'; wavActive = false;
-            serial_print("\n  >> Plotter mode\n");
-            serial_print("  >> Send D to return to dashboard\n\n");
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        if (c == 'W') {
-            viewMode = 'W';
-            serial_printf("\n  >> WAV stream: %d sec, %d Hz, mono (beamformed + NR, esp-dsp)\n",
-                          WAV_DURATION_S, SAMPLE_RATE);
-            serial_print("  >> Start Python recorder, then send any key...\n\n");
-            while (!serial_available()) vTaskDelay(pdMS_TO_TICKS(10));
-            serial_read();  // consume key
-            start_wav_stream();
-        }
-        if (c == 'H') {
-            serial_print("\n  +---------------------------------------+\n");
-            serial_print("  | 1=Mic1  2=Mic2  B=Both                |\n");
-            serial_print("  | D=Dashboard  P=Plotter  W=WAV record  |\n");
-            serial_print("  | C=Calibrate  H=Help                   |\n");
-            serial_print("  +---------------------------------------+\n\n");
+        switch (c) {
+            case '1':
+                mode = '1'; printCount = 0;
+                if (viewMode == 'D') serial_print("\n  >> Mic1\n\n");
+                break;
+            case '2':
+                mode = '2'; printCount = 0;
+                if (viewMode == 'D') serial_print("\n  >> Mic2\n\n");
+                break;
+            case 'B':
+                mode = 'B'; printCount = 0;
+                if (viewMode == 'D') serial_print("\n  >> Both\n\n");
+                break;
+            case 'C':
+                viewMode = 'D';
+                calibrate(true);
+                printCount = 0;
+                break;
+            case 'D':
+                viewMode = 'D'; printCount = 0; wavActive = false;
+                serial_print("\n  >> Dashboard mode\n\n");
+                break;
+            case 'P':
+                viewMode = 'P'; wavActive = false;
+                serial_print("\n  >> Plotter mode (post-processed AFE output)\n");
+                serial_print("  >> Send D to return to dashboard\n\n");
+                vTaskDelay(pdMS_TO_TICKS(500));
+                break;
+            case 'W':
+                viewMode = 'W';
+                wavABMode = false;
+                serial_printf("\n  >> WAV stream: %d sec, %d Hz, mono (processed)\n", WAV_DURATION_S, SAMPLE_RATE);
+                serial_print("  >> Pipeline: AFE HIGH_PERF → Coherence → MMSE-LSA → EQ → Formant\n");
+                serial_print("  >> Start Python recorder, then send any key...\n\n");
+                while (!serial_available()) vTaskDelay(pdMS_TO_TICKS(10));
+                serial_read();
+                start_wav_stream();
+                break;
+            case 'A':
+                viewMode = 'W';
+                wavABMode = true;
+                serial_printf("\n  >> A/B WAV: %d sec, %d Hz, STEREO\n", WAV_DURATION_S, SAMPLE_RATE);
+                serial_print("  >> Left=RAW mic  Right=PROCESSED (AFE+post)\n");
+                serial_print("  >> Start Python recorder, then send any key...\n\n");
+                while (!serial_available()) vTaskDelay(pdMS_TO_TICKS(10));
+                serial_read();
+                start_wav_stream();
+                break;
+            case 'V': {
+                bool en = !vad_fsm_get_auto_record();
+                vad_fsm_set_auto_record(en);
+                serial_printf("\n  >> VAD auto-record: %s\n\n", en ? "ON" : "OFF");
+                break;
+            }
+            case 'E': {
+                bool en = !post_get_eq_enabled();
+                post_set_eq_enabled(en);
+                serial_printf("\n  >> Spectral tilt EQ: %s\n\n", en ? "ON" : "OFF");
+                printCount = 0;
+                break;
+            }
+            case 'M': {
+                bool en = !post_get_mmse_enabled();
+                post_set_mmse_enabled(en);
+                serial_printf("\n  >> MMSE-LSA: %s\n\n", en ? "ON" : "OFF");
+                printCount = 0;
+                break;
+            }
+            case 'F': {
+                bool en = !post_get_formant_enabled();
+                post_set_formant_enabled(en);
+                serial_printf("\n  >> Formant enhancement: %s\n\n", en ? "ON" : "OFF");
+                printCount = 0;
+                break;
+            }
+            case 'G': {
+                bool en = !coh_get_enabled();
+                coh_set_enabled(en);
+                serial_printf("\n  >> Coherence filter: %s\n\n", en ? "ON" : "OFF");
+                printCount = 0;
+                break;
+            }
+            case 'H':
+                serial_print("\n  +═══════════════════════════════════════════════+\n");
+                serial_print("  | MOSA Tier 2 — High-Quality Voice Engine      |\n");
+                serial_print("  +───────────────────────────────────────────────+\n");
+                serial_print("  | VIEW:  D=Dashboard  P=Plotter  W=WAV  A=A/B  |\n");
+                serial_print("  | MIC:   1=Mic1  2=Mic2  B=Both                |\n");
+                serial_print("  | AUDIO: C=Calibrate  V=VAD auto-record toggle |\n");
+                serial_print("  | POST:  E=EQ  M=MMSE  F=Formant  G=Coherence  |\n");
+                serial_print("  | INFO:  H=Help                                |\n");
+                serial_print("  +───────────────────────────────────────────────+\n");
+                serial_print("  | Pipeline: AFE_VC HIGH_PERF                   |\n");
+                serial_print("  |   BSS + NSNet DNN + VADNet + AGC             |\n");
+                serial_print("  |   → Coherence Wiener → MMSE-LSA             |\n");
+                serial_print("  |   → Spectral Tilt EQ → Formant Enhance      |\n");
+                serial_print("  +═══════════════════════════════════════════════+\n\n");
+                break;
         }
     }
 }
 
 // ══════════════════════════════════════
-// MAIN (ESP-IDF entry point)
+// MAIN
 // ══════════════════════════════════════
 
 extern "C" void app_main(void) {
-    // USB Serial
     serial_init();
     vTaskDelay(pdMS_TO_TICKS(500));
+
+    // NVS init (for calibration persistence)
+    cal_store_init();
 
     // GPIO: L/R pins LOW for left channel
     gpio_set_direction(M1_LR, GPIO_MODE_OUTPUT);
@@ -751,29 +845,32 @@ extern "C" void app_main(void) {
     gpio_set_direction(M2_LR, GPIO_MODE_OUTPUT);
     gpio_set_level(M2_LR, 0);
 
-    // I2S
+    // I2S at 16 kHz
     setup_i2s(I2S_NUM_0, M1_SCK, M1_WS, M1_SD);
     setup_i2s(I2S_NUM_1, M2_SCK, M2_WS, M2_SD);
 
-    // DSP: init hardware-accelerated FFT + Hann window
-    init_dsp();
-
-    serial_print("\n  +===============================================+\n");
-    serial_print("  |  MOSA_MIC_PROJ — ESP-IDF + esp-dsp            |\n");
-    serial_print("  |  Dual INMP441 Beamformed Noise Reduction      |\n");
+    serial_print("\n  +═══════════════════════════════════════════════+\n");
+    serial_print("  |  MOSA Tier 2 — High-Quality Voice Engine      |\n");
+    serial_print("  |  Dual INMP441 + ESP-SR AFE HIGH_PERF          |\n");
+    serial_print("  |  BSS + NSNet + VADNet + AGC                   |\n");
+    serial_print("  |  + Coherence Wiener + MMSE-LSA + EQ + Formant |\n");
     serial_print("  |  M1: SCK=5 WS=43 SD=6   (I2S0)               |\n");
     serial_print("  |  M2: SCK=9 WS=7  SD=8   (I2S1)               |\n");
-    serial_print("  |  FFT: esp-dsp HW accelerated on ESP32-S3      |\n");
-    serial_print("  |  [D]ash [P]lot [W]av [C]al [1][2][B] [H]elp  |\n");
-    serial_print("  +===============================================+\n");
+    serial_print("  |  16kHz | Neural + Classical DSP pipeline      |\n");
+    serial_print("  |  [D]ash [P]lot [W]av [C]al [V]AD [H]elp     |\n");
+    serial_print("  +═══════════════════════════════════════════════+\n");
 
-    // Calibrate on boot
-    calibrate();
+    // Try loading calibration from NVS; if not available, run fresh calibration
+    if (!try_load_calibration()) {
+        calibrate(true);
+    }
 
-    // Main loop
+    // Initialize AFE and start pipeline
+    init_afe();
+
+    // Main loop on Core 0
     while (1) {
         handle_commands();
-
         switch (viewMode) {
             case 'D': mode_dashboard(); break;
             case 'P': mode_plotter();   break;
