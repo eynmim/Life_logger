@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp-sr:
+    version: "^2.0.0"
+  espressif/esp-dsp:
+    version: "^1.4.0"
