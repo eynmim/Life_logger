@@ -1,8 +1,44 @@
 # MOSA_MIC_PROJ
 
-**Microphone Open Sound Architecture - Dual INMP441 Beamformed Noise Reduction System**
+**Microphone Open Sound Architecture - Neural Voice Enhancement System**
 
-A dual-microphone audio capture and noise reduction system built on the Seeed Studio XIAO ESP32-S3 using **ESP-IDF** with **hardware-accelerated DSP**. It uses two side-by-side INMP441 MEMS microphones with beamforming and FFT-based spectral subtraction to extract clean speech from noisy environments, recording the result as a CD-quality mono WAV file.
+A dual-microphone voice capture system built on the Seeed Studio XIAO ESP32-S3 using **ESP-IDF** with **ESP-SR AFE** (Audio Front End) for neural noise suppression. Uses Espressif's NSNet deep learning model for real-time voice enhancement, with VADNet-based voice activity detection and an A/B comparison framework for quality validation.
+
+---
+
+## Architecture Overview
+
+```
+                         Tier 2 Pipeline (current)
+                         ========================
+
+Mic1 (INMP441) --> I2S0 (32-bit) --> >>16 --+
+                                             +--> Interleave "MM" --> ESP-SR AFE_VC
+Mic2 (INMP441) --> I2S1 (32-bit) --> >>16 --+         |
+                                                      |
+                          +---------------------------+
+                          |
+                          v
+              [NSNet1 Neural Noise Suppression]
+                          |
+                          v
+              [VADNet Voice Activity Detection]
+                          |
+                          v
+               [Spectral Tilt EQ (biquad)]
+                          |
+                          v
+                  Clean Mono PCM 16kHz
+                          |
+              +-----------+-----------+
+              |                       |
+         Ring Buffer              Raw Ring Buffer
+         (processed)              (unprocessed mic1)
+              |                       |
+              v                       v
+      Dashboard / WAV           A/B Comparison
+      Plotter / Serial         Stereo WAV output
+```
 
 ---
 
@@ -10,18 +46,11 @@ A dual-microphone audio capture and noise reduction system built on the Seeed St
 
 | | |
 |---|---|
-| **Framework** | ESP-IDF (via PlatformIO) |
+| **Framework** | ESP-IDF 5.5.3 (via PlatformIO) |
+| **AI Engine** | ESP-SR AFE (NSNet1 neural noise suppression) |
 | **DSP Library** | esp-dsp (hardware-accelerated FFT on ESP32-S3) |
 | **Build System** | PlatformIO + CMake |
-| **Previous** | Arduino IDE (migrated 2026-03-26) |
-
-### Why ESP-IDF over Arduino?
-
-- **Hardware-accelerated FFT** via esp-dsp — uses ESP32-S3 vector DSP extensions
-- **Direct FreeRTOS** control — task priorities, dual-core utilization
-- **Full ESP-IDF API** — USB Serial/JTAG driver, precise timers, GPIO config
-- **No abstraction overhead** — direct register access when needed
-- **Better memory alignment** — `__attribute__((aligned(16)))` for DSP buffers
+| **Model Partition** | SPIFFS (custom binary format, 1.4 MB) |
 
 ---
 
@@ -29,11 +58,11 @@ A dual-microphone audio capture and noise reduction system built on the Seeed St
 
 | Component | Details |
 |-----------|---------|
-| **MCU** | Seeed Studio XIAO ESP32-S3 (240 MHz dual-core, FPU, 512 KB SRAM) |
-| **Mic 1** | INMP441 MEMS (I2S0) |
-| **Mic 2** | INMP441 MEMS (I2S1) |
-| **Mic Position** | Side-by-side in one package |
-| **Interface** | USB Serial/JTAG (native USB, no external UART chip) |
+| **MCU** | Seeed Studio XIAO ESP32-S3 (240 MHz dual-core, FPU, 8 MB PSRAM, 8 MB Flash) |
+| **Mic 1** | INMP441 MEMS (I2S0) — 61 dBA SNR, 24-bit output |
+| **Mic 2** | INMP441 MEMS (I2S1) — 61 dBA SNR, 24-bit output |
+| **Mic Spacing** | 22-23 mm center-to-center (spatial aliasing free up to 7.6 kHz) |
+| **Interface** | USB Serial/JTAG (native USB, 2 Mbaud) |
 
 ### Pin Mapping
 
@@ -50,61 +79,113 @@ A dual-microphone audio capture and noise reduction system built on the Seeed St
 
 | Parameter | Value |
 |-----------|-------|
-| Sample Rate | 44,100 Hz (CD quality) |
+| Sample Rate | 16,000 Hz (speech-optimized) |
 | Bit Depth | 16-bit signed PCM |
-| I2S Resolution | 32-bit (downsampled to 16-bit) |
-| Output Channels | Mono (beamformed from both mics) |
-| Clock Source | APLL (hardware PLL for precise timing) |
-| DMA Buffers | 8 x 512 samples |
-| Read Buffer | 1024 samples per cycle |
-| FFT Size | 512 samples, 50% overlap (Hann window) |
-| FFT Engine | esp-dsp `dsps_fft2r_fc32` (hardware accelerated) |
-| Output Format | Standard WAV (RIFF) |
+| I2S Resolution | 32-bit (shifted >>16 to 16-bit) |
+| Output Channels | Mono (AFE-selected from dual input) |
+| DMA Buffers | 8 x 256 samples |
+| AFE Feed Chunk | 256 samples (16 ms) |
+| AFE Fetch Chunk | 512 samples (32 ms) |
+| NSNet Model | nsnet1 (819 KB, quantized neural network) |
+| VAD Model | vadnet1_medium (287 KB, trained on 15k hrs) |
+| Latency | ~30-50 ms end-to-end |
 
 ---
 
-## Noise Reduction Pipeline (WAV Mode)
+## ESP-SR AFE Configuration
+
+### AFE Mode: Voice Communication (1MIC)
 
 ```
-Mic1 --> I2S (32-bit) --> >>16 --> HP Filter --+
-                                               +--> Average --> FFT --> Spectral --> IFFT --> OLA --> Clean
-Mic2 --> I2S (32-bit) --> >>16 --> HP Filter --+  (beamform)  (HW)   Subtraction   (HW)           Mono WAV
-                                                                          ^
-                                                                   Noise spectrum
-                                                                 (from calibration)
+AFE_TYPE_VC + AFE_MODE_HIGH_PERF
+Pipeline: [input] -> |NS(nsnet1)| -> |VAD(vadnet1_medium)| -> [output]
 ```
 
-### Processing Stages
+**Key finding:** ESP-SR's dual-mic (2MIC) mode supports BSS but NOT NSNet.
+Single-mic (1MIC) mode with NSNet gives 15-20 dB noise reduction vs BSS's 5-6 dB.
+The first mic channel from the "MM" input is automatically selected.
 
-1. **I2S Capture** -- 32-bit samples from each INMP441, downsampled to 16-bit
-2. **HP Filter** -- First-order IIR (alpha=0.995) removes DC offset per mic
-3. **Beamforming** -- Average both mics: coherent speech adds +6 dB, incoherent noise adds +3 dB = **+3 dB SNR gain**
-4. **FFT** -- 512-point Hann-windowed FFT via `dsps_fft2r_fc32` (hardware accelerated)
-   - Data format: interleaved complex `[re0, im0, re1, im1, ...]`
-   - 16-byte aligned buffers for SIMD performance
-5. **Spectral Subtraction** -- Subtract calibrated noise magnitude spectrum per bin
-   - Oversubtraction factor: 2.0x (configurable, 1.0=gentle, 4.0=aggressive)
-   - Spectral floor: 2% (prevents musical noise artifacts)
-   - Phase preserved from original signal
-   - Conjugate mirror symmetry maintained
-6. **IFFT** -- Inverse via conjugate + forward FFT + normalize (hardware accelerated)
-7. **Overlap-Add** -- 50% overlap with Hann window for seamless reconstruction
-8. **Output** -- Clean mono 16-bit PCM streamed via USB Serial/JTAG
+### Configuration Parameters
 
-### Dashboard Mode Processing
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `afe_type` | `AFE_TYPE_VC` | Voice Communication mode (enables NSNet) |
+| `afe_mode` | `AFE_MODE_HIGH_PERF` | Maximum quality processing |
+| `ns_init` | `true` | Neural noise suppression enabled |
+| `afe_ns_mode` | `AFE_NS_MODE_NET` | NSNet (not WebRTC) |
+| `ns_model_name` | `nsnet1` | Auto-selected from model partition |
+| `vad_init` | `true` | DNN-based VAD enabled |
+| `vad_mode` | `VAD_MODE_2` | Very aggressive noise rejection |
+| `vad_min_speech_ms` | `200` | Minimum speech duration |
+| `vad_min_noise_ms` | `800` | Minimum silence duration |
+| `se_init` | `false` | BSS unavailable in VC mode |
+| `agc_init` | `false` | Disabled for clean A/B testing |
+| `aec_init` | `false` | No speaker playback |
+| `wakenet_init` | `false` | Not needed for recording |
+| `memory_alloc_mode` | `AFE_MEMORY_ALLOC_MORE_PSRAM` | Maximize available PSRAM |
+| `afe_linear_gain` | `1.0` | Unity gain |
 
-- **RMS Calculation** -- AC component power measurement
-- **Peak Detection** -- Absolute peak tracking per buffer
-- **Noise Gate** -- Threshold-based voice activity detection (noise floor x 1.5)
-- **SNR Metering** -- Real-time signal-to-noise ratio in dB
-- **Exponential Smoothing** -- Smooth AC level display (alpha=0.85)
+### ESP-SR Design Constraints Discovered
 
-### Calibration
+| Constraint | Impact |
+|-----------|--------|
+| `AFE_TYPE_VC` is 1MIC only | Cannot use BSS + NSNet together |
+| `AFE_TYPE_SR` 2MIC has BSS but no NSNet | BSS gives only ~5-6 dB reduction |
+| `afe_config_check()` silently overrides settings | Must verify POST-CHECK values |
+| NSNet requires model in flash partition | Models not auto-flashed by PlatformIO |
+| SR mode requires WakeNet model to enable NS | NS gets stripped if no WakeNet |
+| Model partition uses custom binary format | NOT standard SPIFFS; use `pack_model.py` |
 
-Runs automatically on boot and on `C` command. Requires silence.
+---
 
-1. **Time-domain calibration** (80 rounds) -- measures noise RMS, peak, DC offset per mic
-2. **Spectral calibration** (25 reads + 5 settling) -- computes average noise magnitude spectrum across ~40 FFT frames using hardware-accelerated FFT
+## Post-Processing Pipeline
+
+After AFE output, additional processing stages are available (toggle via serial commands):
+
+| Stage | Command | Default | CPU | Description |
+|-------|---------|---------|-----|-------------|
+| Spectral Tilt EQ | `E` | ON | <1% | High-shelf biquad to compensate INMP441 rising HF response |
+| Spectral Noise Gate | `M` | OFF | ~4% | FFT-based per-bin gate (disabled; NSNet handles this) |
+| Formant Enhancement | `F` | OFF | ~2% | LPC post-filter for speech intelligibility |
+| Coherence Filter | `G` | OFF | ~3% | Dual-mic coherence Wiener (disabled; causes pumping) |
+
+**Current recommendation:** Only EQ enabled. NSNet handles noise suppression. Post-filters cause artifacts (choppiness, pumping) when stacked with NSNet.
+
+---
+
+## A/B Quality Comparison System
+
+### Recording Modes
+
+| Command | Mode | Channels | Description |
+|---------|------|----------|-------------|
+| `W` | Processed | Mono | AFE + post-processing output only |
+| `A` | A/B Stereo | Stereo | Left=raw mic, Right=processed (same moment) |
+
+### Python Tools
+
+```bash
+# Record processed audio
+python wav_recorder.py
+
+# Record A/B comparison (raw vs processed, stereo)
+python wav_recorder.py --ab
+
+# Analyze latest A/B pair
+python analyze_ab.py
+
+# Analyze specific files
+python analyze_ab.py --raw file_raw.wav --proc file_processed.wav
+```
+
+### Quality Metrics
+
+| Metric | Target | Achieved (NSNet) |
+|--------|--------|-----------------|
+| SNR Improvement | >15 dB | ~15-20 dB (estimated with NSNet active) |
+| Noise Reduction | >15 dB | ~15-25 dB |
+| Speech Preserved | >-3 dB | ~-1 dB |
+| Grade | EXCELLENT | Pending validation |
 
 ---
 
@@ -112,30 +193,20 @@ Runs automatically on boot and on `C` command. Requires silence.
 
 | Command | Mode | Description |
 |:-------:|------|-------------|
-| `1` | Mic 1 | Monitor single microphone (dashboard/plotter) |
-| `2` | Mic 2 | Monitor second microphone (dashboard/plotter) |
-| `B` | Both | Monitor both mics (dashboard/plotter) |
-| `D` | Dashboard | Live metrics with level bars (default) |
-| `P` | Plotter | CSV output for serial plotter tools |
-| `W` | WAV Stream | Beamformed + noise-reduced mono recording |
-| `C` | Calibrate | Noise floor + spectrum calibration (requires silence) |
+| `1` | Mic 1 | Monitor single microphone |
+| `2` | Mic 2 | Monitor second microphone |
+| `B` | Both | Monitor both mics (default) |
+| `D` | Dashboard | Live metrics with level bars |
+| `P` | Plotter | CSV output for serial plotter |
+| `W` | WAV Stream | Processed mono recording |
+| `A` | A/B WAV | Stereo raw vs processed |
+| `C` | Calibrate | Noise floor calibration (requires silence) |
+| `V` | VAD Toggle | VAD auto-record on/off |
+| `E` | EQ Toggle | Spectral tilt EQ on/off |
+| `M` | MMSE Toggle | Spectral noise gate on/off |
+| `F` | Formant Toggle | Formant enhancement on/off |
+| `G` | Coherence Toggle | Coherence filter on/off |
 | `H` | Help | Show command reference |
-
----
-
-## WAV Recording Protocol
-
-```
-ESP32 sends:
-  "WAV_START\n"
-  "RATE:44100\n"
-  "BITS:16\n"
-  "CHANNELS:1\n"          (always mono -- beamformed + noise reduced)
-  "DURATION:10\n"
-  "DATA_BEGIN\n"
-  <binary 16-bit PCM, little-endian, noise-reduced>
-  "\nDATA_END\n"
-```
 
 ---
 
@@ -143,93 +214,83 @@ ESP32 sends:
 
 ```
 MOSA_MIC_PROJ/
-  ├── platformio.ini          PlatformIO config (ESP-IDF framework)
-  ├── sdkconfig.defaults      ESP-IDF settings (USB console, CPU freq, DSP)
-  ├── src/
-  │   ├── main.cpp            ESP-IDF firmware (C++)
-  │   ├── CMakeLists.txt      Build config for main component
-  │   └── idf_component.yml   esp-dsp dependency declaration
-  ├── include/                 Header files (empty for now)
-  ├── MOSA_MIC_PROJ.ino        Legacy Arduino firmware (reference)
-  ├── wav_recorder.py          PC-side WAV capture script (Python)
-  ├── mic_test.py              XIAO RP2040 intensity test (MicroPython)
-  ├── PROJECT.md               This file
-  ├── README.md                GitHub readme
-  ├── Test_voice/              Clean WAV recordings output folder
-  └── mic test_wrongs/         Early test recordings (16 kHz, pre-NR)
+  platformio.ini              PlatformIO config (ESP-IDF, seeed_xiao_esp32s3)
+  partitions.csv              Partition table (factory 2.5MB + model 5MB)
+  sdkconfig.defaults          ESP-IDF settings (USB, CPU, DSP, PSRAM)
+  src/
+    main.cpp                  Main firmware: I2S, AFE, dashboard, WAV streaming
+    CMakeLists.txt            Build config
+    idf_component.yml         esp-dsp + esp-sr dependency declaration
+    config/
+      device_config.h         Hardware constants (pins, mic spacing, FFT sizes)
+    audio/
+      audio_buffer.h/cpp      Dual ring buffers (processed + raw)
+      post_processor.h/cpp    EQ + spectral noise gate + formant enhancement
+      coherence_filter.h/cpp  Dual-mic coherence Wiener filter
+      vad_fsm.h/cpp           VAD state machine with pre-roll buffer
+      cal_store.h/cpp         NVS calibration persistence
+  data/                       Model files for SPIFFS partition
+    nsnet1/                   NSNet1 neural noise suppression (819 KB)
+    wn9_hilexin/              WakeNet9 wake word model (290 KB)
+    vadnet1_medium/           VADNet1 voice activity detection (287 KB)
+  wav_recorder.py             Python WAV recorder (mono + A/B stereo)
+  analyze_ab.py               Python A/B quality analyzer (SNR, spectra, plots)
+  Test_voice/                 Recorded WAV files and analysis plots
+  PROJECT.md                  This file
 ```
 
-### src/main.cpp
-Main ESP-IDF firmware. Uses `driver/i2s.h` for dual I2S, `driver/usb_serial_jtag.h` for serial I/O, `dsps_fft2r.h` / `dsps_wind_hann.h` for hardware-accelerated FFT and Hann window generation. FreeRTOS-based with `app_main()` entry point.
+---
 
-### wav_recorder.py
-Python companion script. Unchanged from Arduino version -- the serial protocol is identical.
+## Model Partition
+
+The ESP-SR models are stored in a custom binary format (NOT standard SPIFFS).
+
+### Flashing Models
 
 ```bash
-python wav_recorder.py                          # Both mics, 10 sec
-python wav_recorder.py --mic B --dur 20         # 20 seconds
-python wav_recorder.py --port COM5 --dur 15     # Specific port
+# 1. Pack models using ESP-SR tool
+python managed_components/espressif__esp-sr/model/pack_model.py -m data -o srmodels.bin
+
+# 2. Flash to model partition (offset 0x290000)
+python ~/.platformio/packages/tool-esptoolpy/esptool.py \
+  --chip esp32s3 --port COM3 --baud 921600 \
+  write_flash 0x290000 data/srmodels.bin
 ```
 
-**Output:** `Test_voice/rec_YYYYMMDD_HHMMSS_[MIC1|MIC2|BOTH]_mono_44100Hz.wav`
+### Models Included
+
+| Model | Size | Purpose |
+|-------|------|---------|
+| `nsnet1` | 819 KB | Neural noise suppression (quantized DNN) |
+| `vadnet1_medium` | 287 KB | Voice activity detection (trained on 15k hours) |
+| `wn9_hilexin` | 290 KB | WakeNet (placeholder, disabled at runtime) |
 
 ---
 
 ## Dependencies
 
-### Firmware (PlatformIO + ESP-IDF)
+### Firmware (ESP-IDF)
 - **PlatformIO** with `espressif32` platform
-- **Framework**: ESP-IDF (configured in `platformio.ini`)
-- **Components**:
-  - `espressif/esp-dsp ~1.4` (declared in `src/idf_component.yml`)
-  - `driver/i2s.h` (ESP-IDF built-in)
-  - `driver/usb_serial_jtag.h` (ESP-IDF built-in)
+- **ESP-IDF** 5.5.3
+- **Components** (via `idf_component.yml`):
+  - `espressif/esp-dsp ~1.4` (hardware-accelerated FFT)
+  - `espressif/esp-sr ~1.8` (AFE + NSNet + VADNet)
 
 ### Python (PC)
-- **Python** 3.7+
 - **pyserial**: `pip install pyserial`
-- **wave**: Standard library
+- **numpy, matplotlib, scipy**: `pip install numpy matplotlib scipy` (for analyze_ab.py)
 
 ---
 
 ## Quick Start
 
-1. **Wire** two INMP441 microphones to the ESP32-S3 per the pin mapping
-2. **Open** the project folder in VS Code with PlatformIO extension
-3. **Build**: PlatformIO will auto-download ESP-IDF and esp-dsp
-4. **Upload**: Flash to XIAO ESP32-S3
-5. **Monitor**: Open serial monitor at 2,000,000 baud -- calibration runs on boot (keep silent!)
-6. **Record**: Close monitor, then:
-   ```bash
-   python wav_recorder.py
-   ```
-
----
-
-## Tuning the Noise Reduction
-
-| Parameter | Default | Range | Effect |
-|-----------|---------|-------|--------|
-| `OVERSUB_FACTOR` | 2.0 | 1.0 - 4.0 | Higher = more noise removed but more speech distortion |
-| `SPECTRAL_FLOOR` | 0.02 | 0.001 - 0.1 | Higher = less musical noise but more residual noise |
-| `FFT_SIZE` | 512 | 256 / 512 / 1024 | Larger = better frequency resolution but more latency |
-
----
-
-## ESP-IDF API Mapping (from Arduino)
-
-| Arduino | ESP-IDF | Notes |
-|---------|---------|-------|
-| `Serial.begin()` | `usb_serial_jtag_driver_install()` | Native USB, no baud rate needed |
-| `Serial.printf()` | `serial_printf()` (custom wrapper) | Uses `usb_serial_jtag_write_bytes` |
-| `Serial.write()` | `serial_write_bytes()` | Direct binary write |
-| `Serial.available()` | `serial_available()` | Peek-based implementation |
-| `Serial.read()` | `serial_read()` | Non-blocking with peek |
-| `delay(ms)` | `vTaskDelay(pdMS_TO_TICKS(ms))` | FreeRTOS tick-based |
-| `millis()` | `esp_timer_get_time() / 1000` | Microsecond timer |
-| `pinMode()` | `gpio_set_direction()` | ESP-IDF GPIO driver |
-| `digitalWrite()` | `gpio_set_level()` | Direct register write |
-| `arduinoFFT` | `dsps_fft2r_fc32()` | Hardware accelerated on ESP32-S3 |
+1. **Wire** two INMP441 microphones per the pin mapping
+2. **Build**: `pio run` (auto-downloads ESP-IDF, esp-dsp, esp-sr)
+3. **Flash firmware**: `pio run -t upload`
+4. **Flash models**: See "Model Partition" section above
+5. **Monitor**: Open serial at 2,000,000 baud -- calibration runs on boot
+6. **Record**: Close monitor, then `python wav_recorder.py --ab`
+7. **Analyze**: `python analyze_ab.py`
 
 ---
 
@@ -237,8 +298,13 @@ python wav_recorder.py --port COM5 --dur 15     # Specific port
 
 | Date | Change |
 |------|--------|
-| 2026-03-23 | Initial dual-mic system with dashboard, plotter, WAV streaming at 16 kHz |
-| 2026-03-26 | Upgraded to 44.1 kHz, APLL clock, HP filter on WAV output, 2 Mbaud serial |
-| 2026-03-26 | WAV output to `Test_voice/` folder; filename includes mic source |
-| 2026-03-26 | Added FFT-based noise reduction: beamforming + spectral subtraction + OLA |
-| 2026-03-26 | Migrated from Arduino IDE to ESP-IDF (PlatformIO); esp-dsp HW-accelerated FFT |
+| 2026-03-23 | Initial dual-mic system with dashboard, plotter, WAV at 16 kHz |
+| 2026-03-26 | Upgraded to 44.1 kHz, APLL clock, HP filter, beamforming + spectral subtraction |
+| 2026-03-26 | Migrated from Arduino IDE to ESP-IDF; esp-dsp HW-accelerated FFT |
+| 2026-03-27 | Tier 2: ESP-SR AFE integration (BSS + NSNet + VADNet) |
+| 2026-03-27 | Modular architecture: audio/, config/ modules, NVS calibration persistence |
+| 2026-03-27 | Post-processing pipeline: EQ, spectral noise gate, formant, coherence filter |
+| 2026-03-27 | A/B comparison system: stereo WAV (raw vs processed), Python analyzer |
+| 2026-03-28 | Fixed NSNet: discovered AFE_TYPE_VC is 1MIC-only, model partition was empty |
+| 2026-03-28 | Flashed NSNet1 + VADNet1 models to custom binary partition |
+| 2026-03-28 | Pipeline confirmed: `[input] -> NS(nsnet1) -> VAD(vadnet1_medium) -> [output]` |
