@@ -68,9 +68,9 @@ clean audio using ESP-SR AFE with neural noise suppression.
 
 ## 3. Tier 2 — Core Audio Engine
 
-**Status:** NEXT
-**Target Start:** 2026-03-28
-**Estimated Duration:** 2-3 weeks
+**Status:** IN PROGRESS (80% complete)
+**Started:** 2026-03-27
+**Estimated Completion:** 2026-04-05
 
 ### 3.1 Objectives
 Build a production-quality audio processing engine with modular architecture,
@@ -110,14 +110,14 @@ src/
 **Tasks:**
 | # | Task | Priority | Estimate |
 |---|---|---|---|
-| 2.1.1 | Define module interfaces (headers) | Must | 2 days |
-| 2.1.2 | Extract I2S capture module | Must | 1 day |
-| 2.1.3 | Extract AFE engine module | Must | 1 day |
-| 2.1.4 | Extract ring buffer as generic utility | Must | 0.5 day |
-| 2.1.5 | Extract serial I/O + CLI module | Must | 1 day |
-| 2.1.6 | Create device_config.h with all constants | Must | 0.5 day |
-| 2.1.7 | Create event bus for inter-module communication | Should | 1 day |
-| 2.1.8 | Verify all modes work after refactor | Must | 1 day |
+| 2.1.1 | Define module interfaces (headers) | Must | 2 days | DONE |
+| 2.1.2 | Extract I2S capture module | Must | 1 day | DONE |
+| 2.1.3 | Extract AFE engine module | Must | 1 day | DONE |
+| 2.1.4 | Extract ring buffer (processed + raw) | Must | 0.5 day | DONE |
+| 2.1.5 | Extract serial I/O + CLI module | Must | 1 day | DONE |
+| 2.1.6 | Create device_config.h with all constants | Must | 0.5 day | DONE |
+| 2.1.7 | Migrate to ESP-ADF build system | Must | 1 day | DONE |
+| 2.1.8 | Verify all modes work after refactor | Must | 1 day | PENDING (need device) |
 
 #### WP-2.2: Voice Activity Detection (VAD)
 **Goal:** Automatically detect speech segments and trigger recording.
@@ -130,11 +130,11 @@ src/
 **Tasks:**
 | # | Task | Priority | Estimate |
 |---|---|---|---|
-| 2.2.1 | Expose AFE VAD state from fetch results | Must | 0.5 day |
-| 2.2.2 | Implement VAD state machine (idle/pre-speech/speech/post-speech) | Must | 1 day |
-| 2.2.3 | Add pre-roll buffer (capture 500 ms before VAD trigger) | Must | 1 day |
-| 2.2.4 | Serial command to enable/disable VAD auto-record | Must | 0.5 day |
-| 2.2.5 | LED indicator for VAD state | Should | 0.5 day |
+| 2.2.1 | Expose AFE VAD state from fetch results | Must | 0.5 day | DONE |
+| 2.2.2 | Implement VAD state machine (idle/pre-speech/speech/post-speech) | Must | 1 day | DONE |
+| 2.2.3 | Add pre-roll buffer (capture 500 ms before VAD trigger) | Must | 1 day | DONE |
+| 2.2.4 | Serial command to enable/disable VAD auto-record | Must | 0.5 day | DONE |
+| 2.2.5 | LED indicator for VAD state | Should | 0.5 day | Tier 3 |
 
 #### WP-2.3: Automatic Gain Control (AGC)
 **Goal:** Normalize output audio level regardless of speaker distance.
@@ -147,9 +147,9 @@ src/
 **Tasks:**
 | # | Task | Priority | Estimate |
 |---|---|---|---|
-| 2.3.1 | Implement AGC algorithm (attack/release/target) | Must | 1 day |
-| 2.3.2 | Integrate AGC after AFE fetch, before ring buffer | Must | 0.5 day |
-| 2.3.3 | Add AGC enable/disable + parameter tuning via CLI | Should | 0.5 day |
+| 2.3.1 | Implement AGC algorithm (attack/release/target) | Must | 1 day | DONE (ESP-SR WebRTC AGC) |
+| 2.3.2 | Integrate AGC after AFE fetch, before ring buffer | Must | 0.5 day | DONE (disabled — boosts residual noise) |
+| 2.3.3 | Add AGC enable/disable + parameter tuning via CLI | Should | 0.5 day | DONE |
 
 #### WP-2.4: Multi-Rate Audio Support
 **Goal:** Support both 16 kHz (voice) and 48 kHz (hi-fi) modes.
@@ -168,10 +168,56 @@ src/
 **Tasks:**
 | # | Task | Priority | Estimate |
 |---|---|---|---|
-| 2.5.1 | Define calibration data struct for NVS | Must | 0.5 day |
-| 2.5.2 | Save calibration to NVS after successful cal | Must | 0.5 day |
-| 2.5.3 | Load calibration from NVS on boot | Must | 0.5 day |
-| 2.5.4 | CLI command to clear saved calibration | Must | 0.5 day |
+| 2.5.1 | Define calibration data struct for NVS | Must | 0.5 day | DONE |
+| 2.5.2 | Save calibration to NVS after successful cal | Must | 0.5 day | DONE |
+| 2.5.3 | Load calibration from NVS on boot | Must | 0.5 day | DONE |
+| 2.5.4 | CLI command to clear saved calibration | Must | 0.5 day | DONE |
+
+#### WP-2.6: Post-Processing Pipeline (Added)
+**Goal:** Classical DSP stages after AFE for additional voice clarity.
+
+**Status:** Implemented but disabled (NSNet handles noise; stacking causes artifacts).
+
+| # | Task | Priority | Status |
+|---|---|---|---|
+| 2.6.1 | Spectral tilt EQ (biquad high-shelf for INMP441) | Must | DONE (active) |
+| 2.6.2 | Spectral noise gate (FFT per-bin, OLA) | Should | DONE (disabled — fights NSNet) |
+| 2.6.3 | Formant enhancement (LPC post-filter) | Could | DONE (disabled — causes artifacts) |
+| 2.6.4 | Coherence filter (dual-mic Wiener) | Could | DONE (disabled — causes pumping) |
+
+**Key finding:** Post-processing after NSNet causes choppiness and gain pumping. Only EQ is recommended. NSNet handles noise suppression; classical DSP should not be stacked.
+
+#### WP-2.7: A/B Quality Comparison System (Added)
+**Goal:** Measure noise suppression effectiveness objectively.
+
+| # | Task | Priority | Status |
+|---|---|---|---|
+| 2.7.1 | Raw ring buffer (unprocessed mic1 parallel capture) | Must | DONE |
+| 2.7.2 | A/B stereo WAV mode (L=raw, R=processed, same moment) | Must | DONE |
+| 2.7.3 | Python analyzer (SNR, spectral comparison, plots) | Must | DONE |
+| 2.7.4 | Validate NSNet gives >15 dB SNR improvement | Must | PENDING (need device) |
+
+#### WP-2.8: ESP-ADF Migration (Added)
+**Goal:** Migrate from PlatformIO to native ESP-ADF for Tier 3 readiness.
+
+| # | Task | Priority | Status |
+|---|---|---|---|
+| 2.8.1 | Install ESP-ADF v2.8 with ESP-IDF 5.5 | Must | DONE |
+| 2.8.2 | Create ESP-ADF project structure (main/, CMakeLists) | Must | DONE |
+| 2.8.3 | Migrate firmware to main/ with idf_component.yml | Must | DONE |
+| 2.8.4 | Verify build with ESP-IDF VS Code extension | Must | DONE |
+| 2.8.5 | Flash and verify on hardware | Must | PENDING (need device) |
+| 2.8.6 | Remove legacy PlatformIO src/ directory | Should | After validation |
+
+#### WP-2.9: ESP-SR Constraints Documented (Added)
+**Goal:** Document critical ESP-SR limitations discovered during integration.
+
+Key findings:
+- `AFE_TYPE_VC` = 1MIC only (uses NSNet, ignores second mic)
+- `AFE_TYPE_SR` = 2MIC + BSS but NO NSNet (only ~5-6 dB reduction)
+- NSNet + BSS are mutually exclusive in ESP-SR
+- `afe_config_check()` silently overrides settings
+- Model partition uses custom binary format (`pack_model.py`), not SPIFFS
 
 ### 3.3 Tier 2 Exit Criteria
 

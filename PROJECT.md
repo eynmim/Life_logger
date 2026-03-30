@@ -46,11 +46,13 @@ Mic2 (INMP441) --> I2S1 (32-bit) --> >>16 --+         |
 
 | | |
 |---|---|
-| **Framework** | ESP-IDF 5.5.3 (via PlatformIO) |
+| **Audio Framework** | ESP-ADF v2.8 (Espressif Audio Development Framework) |
+| **Base Framework** | ESP-IDF 5.5.2 |
 | **AI Engine** | ESP-SR AFE (NSNet1 neural noise suppression) |
 | **DSP Library** | esp-dsp (hardware-accelerated FFT on ESP32-S3) |
-| **Build System** | PlatformIO + CMake |
-| **Model Partition** | SPIFFS (custom binary format, 1.4 MB) |
+| **Build System** | ESP-IDF CMake (via VS Code ESP-IDF extension) |
+| **Model Partition** | Custom binary format (pack_model.py), 1.4 MB |
+| **Previous** | PlatformIO (migrated 2026-03-30) |
 
 ---
 
@@ -214,28 +216,35 @@ python analyze_ab.py --raw file_raw.wav --proc file_processed.wav
 
 ```
 MOSA_MIC_PROJ/
-  platformio.ini              PlatformIO config (ESP-IDF, seeed_xiao_esp32s3)
+  CMakeLists.txt              Root project (references $ADF_PATH/components)
   partitions.csv              Partition table (factory 2.5MB + model 5MB)
-  sdkconfig.defaults          ESP-IDF settings (USB, CPU, DSP, PSRAM)
-  src/
-    main.cpp                  Main firmware: I2S, AFE, dashboard, WAV streaming
-    CMakeLists.txt            Build config
-    idf_component.yml         esp-dsp + esp-sr dependency declaration
-    config/
-      device_config.h         Hardware constants (pins, mic spacing, FFT sizes)
+  sdkconfig.defaults          ESP-IDF / ESP-ADF settings
+  main/                       *** ESP-ADF main component ***
+    main.cpp                  Firmware: I2S, AFE, dashboard, WAV, A/B streaming
+    CMakeLists.txt            Component registration (REQUIRES esp-sr, esp-dsp)
+    idf_component.yml         esp-sr + esp-dsp dependency declaration
     audio/
       audio_buffer.h/cpp      Dual ring buffers (processed + raw)
       post_processor.h/cpp    EQ + spectral noise gate + formant enhancement
       coherence_filter.h/cpp  Dual-mic coherence Wiener filter
-      vad_fsm.h/cpp           VAD state machine with pre-roll buffer
+      vad.h/cpp               VAD state machine with pre-roll buffer
+    config/
+      device_config.h         Hardware constants (pins, mic spacing, FFT sizes)
       cal_store.h/cpp         NVS calibration persistence
-  data/                       Model files for SPIFFS partition
+    hal/
+      serial_io.h/cpp         USB Serial/JTAG abstraction
+  data/                       ESP-SR model files
     nsnet1/                   NSNet1 neural noise suppression (819 KB)
     wn9_hilexin/              WakeNet9 wake word model (290 KB)
     vadnet1_medium/           VADNet1 voice activity detection (287 KB)
+  docs/
+    PDS.md                    Product Design Specification
+    WPS.md                    Work Plan Specification & Roadmap
   wav_recorder.py             Python WAV recorder (mono + A/B stereo)
   analyze_ab.py               Python A/B quality analyzer (SNR, spectra, plots)
   Test_voice/                 Recorded WAV files and analysis plots
+  src/                        Legacy PlatformIO source (reference, to be removed)
+  platformio.ini              Legacy PlatformIO config (reference, to be removed)
   PROJECT.md                  This file
 ```
 
@@ -269,12 +278,13 @@ python ~/.platformio/packages/tool-esptoolpy/esptool.py \
 
 ## Dependencies
 
-### Firmware (ESP-IDF)
-- **PlatformIO** with `espressif32` platform
-- **ESP-IDF** 5.5.3
-- **Components** (via `idf_component.yml`):
+### Firmware
+- **ESP-ADF** v2.8 (includes audio_pipeline, audio_stream, audio_recorder)
+- **ESP-IDF** 5.5.2+
+- **Components** (via `main/idf_component.yml`):
   - `espressif/esp-dsp ~1.4` (hardware-accelerated FFT)
-  - `espressif/esp-sr ~1.8` (AFE + NSNet + VADNet)
+  - `espressif/esp-sr ^2.0` (AFE + NSNet + VADNet)
+- **VS Code** with ESP-IDF extension
 
 ### Python (PC)
 - **pyserial**: `pip install pyserial`
@@ -285,12 +295,14 @@ python ~/.platformio/packages/tool-esptoolpy/esptool.py \
 ## Quick Start
 
 1. **Wire** two INMP441 microphones per the pin mapping
-2. **Build**: `pio run` (auto-downloads ESP-IDF, esp-dsp, esp-sr)
-3. **Flash firmware**: `pio run -t upload`
-4. **Flash models**: See "Model Partition" section above
-5. **Monitor**: Open serial at 2,000,000 baud -- calibration runs on boot
-6. **Record**: Close monitor, then `python wav_recorder.py --ab`
-7. **Analyze**: `python analyze_ab.py`
+2. **Install** ESP-IDF extension in VS Code, then install ESP-ADF via sidebar
+3. **Open** project folder in VS Code
+4. **Set target**: ESP-IDF sidebar -> Set Espressif Device Target -> ESP32-S3
+5. **Build**: ESP-IDF sidebar -> Build Project
+6. **Flash**: ESP-IDF sidebar -> Flash Device (firmware + models in one step)
+7. **Monitor**: ESP-IDF sidebar -> Monitor Device (calibration runs on boot)
+8. **Record**: Close monitor, then `python wav_recorder.py --ab`
+9. **Analyze**: `python analyze_ab.py`
 
 ---
 
@@ -308,3 +320,7 @@ python ~/.platformio/packages/tool-esptoolpy/esptool.py \
 | 2026-03-28 | Fixed NSNet: discovered AFE_TYPE_VC is 1MIC-only, model partition was empty |
 | 2026-03-28 | Flashed NSNet1 + VADNet1 models to custom binary partition |
 | 2026-03-28 | Pipeline confirmed: `[input] -> NS(nsnet1) -> VAD(vadnet1_medium) -> [output]` |
+| 2026-03-30 | Migrated from PlatformIO to ESP-ADF v2.8 native build system |
+| 2026-03-30 | Created main/ directory structure (ESP-IDF convention) |
+| 2026-03-30 | Root CMakeLists.txt references $ADF_PATH/components |
+| 2026-03-30 | Updated all documentation (README, PROJECT, WPS) |
